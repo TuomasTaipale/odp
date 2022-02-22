@@ -1,3 +1,5 @@
+:imagesdir: ../images
+
 == PktIO Processing
 Before packets can be manipulated they typically need to be _received_ and
 after they are manipulated they need to be _transmitted_. The ODP abstraction

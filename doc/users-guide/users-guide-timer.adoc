@@ -1,3 +1,5 @@
+:imagesdir: ../images
+
 == Timers and Timeout Events
 The ODP Timer APIs offer a set of functions that permit applications to react
 to the passage of time, and are designed to reflect the underlying hardware

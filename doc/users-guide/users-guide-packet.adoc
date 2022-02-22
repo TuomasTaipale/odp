@@ -1,3 +1,5 @@
+:imagesdir: ../images
+
 == Packet Processing
 ODP applications are designed to process packets, which are the basic unit of
 data of interest in the data plane. To assist in processing packets, ODP
