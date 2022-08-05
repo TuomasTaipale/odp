@@ -12,6 +12,7 @@
 #include <odp/api/thread.h>
 
 #include <odp/api/abi/spinlock_recursive.h>
+#include <odp/api/abi/debug.h>
 
 /** @cond _ODP_HIDE_FROM_DOXYGEN_ */
 
@@ -72,6 +73,8 @@ _ODP_INLINE int odp_spinlock_recursive_trylock(odp_spinlock_recursive_t *rlock)
 
 _ODP_INLINE void odp_spinlock_recursive_unlock(odp_spinlock_recursive_t *rlock)
 {
+	ODP_ASSERT(rlock->cnt > 0);
+
 	rlock->cnt--;
 
 	if (rlock->cnt > 0)
