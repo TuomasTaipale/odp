@@ -55,6 +55,16 @@ odp_global_data_rw_t *odp_global_rw;
 /* odp_init_local() call status */
 static __thread uint8_t init_local_called;
 
+odp_log_func_t odp_get_log_fn(void)
+{
+	return odp_global_ro.log_fn;
+}
+
+odp_abort_func_t odp_get_abort_fn(void)
+{
+	return odp_global_ro.abort_fn;
+}
+
 static void disable_features(odp_global_data_ro_t *global_ro,
 			     const odp_init_t *init_param)
 {

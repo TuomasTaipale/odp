@@ -106,6 +106,26 @@ typedef int (*odp_log_func_t)(odp_log_level_t level, const char *fmt, ...);
 typedef void (*odp_abort_func_t)(void) ODP_NORETURN;
 
 /**
+ * Get ODP log function
+ *
+ * Get the currently configured ODP log function.
+ *
+ * @return ODP log function
+ * @retval NULL if no function set
+ */
+odp_log_func_t odp_get_log_fn(void);
+
+/**
+ * Get ODP abort function
+ *
+ * Get the currently configured ODP abort function.
+ *
+ * @return ODP abort function
+ * @retval NULL if no function set
+ */
+odp_abort_func_t odp_get_abort_fn(void);
+
+/**
  * Application memory model
  */
 typedef enum {
