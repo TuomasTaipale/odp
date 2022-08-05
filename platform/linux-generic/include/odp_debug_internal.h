@@ -53,15 +53,6 @@ static inline void check_printf_format(const char *fmt, ...)
 	} while (0)
 
 /**
- * Runtime assertion-macro - aborts if 'cond' is false.
- */
-#define ODP_ASSERT(cond) \
-	do { if ((ODP_DEBUG == 1) && (!(cond))) { \
-		ODP_ERR("%s\n", #cond); \
-		odp_global_ro.abort_fn(); } \
-	} while (0)
-
-/**
  * This macro is used to indicate when a given function is not implemented
  */
 #define ODP_UNIMPLEMENTED() \

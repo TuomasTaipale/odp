@@ -28,6 +28,19 @@ extern "C" {
  * @param msg  Compile time error message to be displayed if cond is false
  */
 
+/**
+ * @def ODP_ASSERT
+ * Runtime assertion-macro, calls configured ODP abort function if 'cond' is
+ * false.
+ *
+ * @param cond Conditional expression to be evaluated at runtime
+ */
+
+/**
+ * @def ODP_DEBUG
+ * Defines inclusion of additional debug code
+ */
+
 #ifdef __cplusplus
 }
 #endif
