@@ -59,7 +59,7 @@ typedef enum {
 } parse_result_t;
 
 enum {
-	DIR_IN = 0U,
+	DIR_IN = 0,
 	DIR_OUT
 };
 
@@ -101,6 +101,21 @@ typedef struct ODP_ALIGNED_CACHE {
 	prog_config_t *prog_config;
 } thread_config_t;
 
+typedef struct {
+	odp_queue_t queue;
+	odp_pool_t pool;
+	odp_cos_t cos;
+	odp_pmr_t pmr;
+} cos_t;
+
+typedef struct {
+	cos_t cos[MAX_SPIS - 1U];
+	odp_pool_t def_pool;
+	odp_queue_t def_queue;
+	odp_cos_t def_cos;
+	uint32_t num_cos;
+} cos_config_t;
+
 typedef struct prog_config_s {
 	odph_thread_t thread_tbl[MAX_WORKERS];
 	thread_config_t thread_config[MAX_WORKERS];
@@ -108,6 +123,7 @@ typedef struct prog_config_s {
 	fwd_entry_t fwd_entries[MAX_FWDS];
 	odp_queue_t sa_qs[MAX_SA_QUEUES];
 	pktio_t pktios[MAX_IFS];
+	cos_config_t cos_config;
 	char *sa_conf_file;
 	char *fwd_conf_file;
 	odp_instance_t odp_instance;
@@ -117,6 +133,7 @@ typedef struct prog_config_s {
 	odp_barrier_t init_barrier;
 	odp_barrier_t term_barrier;
 	uint32_t num_input_qs;
+	uint32_t num_cls_hash_qs;
 	uint32_t num_sa_qs;
 	uint32_t num_output_qs;
 	uint32_t num_pkts;
@@ -124,6 +141,7 @@ typedef struct prog_config_s {
 	uint32_t num_ifs;
 	uint32_t num_sas;
 	uint32_t num_fwds;
+	odp_bool_t is_cls_in_use;
 	int num_thrs;
 	uint8_t mode;
 } prog_config_t;
@@ -166,6 +184,9 @@ static odp_atomic_u32_t is_running;
 static void init_config(prog_config_t *config)
 {
 	memset(config, 0, sizeof(*config));
+	config->cos_config.def_pool = ODP_POOL_INVALID;
+	config->cos_config.def_queue = ODP_QUEUE_INVALID;
+	config->cos_config.def_cos = ODP_COS_INVALID;
 	config->compl_q = ODP_QUEUE_INVALID;
 	config->pktio_pool = ODP_POOL_INVALID;
 	config->num_input_qs = 1;
@@ -328,6 +349,8 @@ static void print_usage(void)
 	       "  -I, --num_input_qs  Input queue count. 1 by default.\n"
 	       "  -S, --num_sa_qs     SA queue count. 1 by default.\n"
 	       "  -O, --num_output_qs Output queue count. 1 by default.\n"
+	       "  -C, --classifier    Use classifier. IPsec traffic is classified based on SPI,\n"
+	       "                      other traffic is hashed to \"--num_input_qs\" queues.\n"
 	       "  -h, --help          This help.\n"
 	       "\n");
 }
@@ -592,6 +615,8 @@ static void parse_fwd_table(prog_config_t *config)
 static parse_result_t check_options(prog_config_t *config)
 {
 	odp_pool_capability_t pool_capa;
+	odp_cls_capability_t cls_capa;
+	uint32_t num_inbound = 0U;
 
 	if (odp_pool_capability(&pool_capa) < 0) {
 		ODPH_ERR("Error querying pool capabilities\n");
@@ -639,6 +664,49 @@ static parse_result_t check_options(prog_config_t *config)
 		return PRS_NOK;
 	}
 
+	if (config->is_cls_in_use) {
+		if (odp_cls_capability(&cls_capa) < 0) {
+			ODPH_ERR("Error querying classification capabilities\n");
+			return PRS_NOK;
+		}
+
+		if (cls_capa.hash_protocols.proto.ipv4_udp == 0U) {
+			ODPH_ERR("IPv4/UDP classification hashing not supported\n");
+			return PRS_NOK;
+		}
+
+		if (cls_capa.supported_terms.bit.ipsec_spi == 0U) {
+			ODPH_ERR("IPsec SPI PMR term not supported\n");
+			return PRS_NOK;
+		}
+
+		for (uint32_t i = 0U; i < MAX_SPIS; ++i)
+			if (spi_to_sa_map[DIR_IN][i] != NULL)
+				++num_inbound;
+
+		if (num_inbound > cls_capa.max_cos) {
+			ODPH_ERR("Invalid number of classes of service (max: %u)\n",
+				 cls_capa.max_cos);
+			return PRS_NOK;
+		}
+
+		if (num_inbound > cls_capa.max_pmr_terms) {
+			ODPH_ERR("Invalid number of packet matching rule terms (max: %u)\n",
+				 cls_capa.max_pmr_terms);
+			return PRS_NOK;
+		}
+
+		if (config->num_input_qs == 0U ||
+		    config->num_input_qs > cls_capa.max_hash_queues) {
+			ODPH_ERR("Invalid number of input queues for classification (min: 1, max: "
+				 "%u)\n", cls_capa.max_hash_queues);
+			return PRS_NOK;
+		}
+
+		config->num_cls_hash_qs = config->num_input_qs;
+		config->num_input_qs = 1U;
+	}
+
 	return PRS_OK;
 }
 
@@ -657,11 +725,12 @@ static parse_result_t parse_options(int argc, char **argv, prog_config_t *config
 		{ "num_input_qs", required_argument, NULL, 'I' },
 		{ "num_sa_qs", required_argument, NULL, 'S' },
 		{ "num_output_qs", required_argument, NULL, 'O' },
+		{ "classifier", no_argument, NULL, 'C' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
 
-	static const char *shortopts = "i:n:l:c:m:s:f:I:S:O:h";
+	static const char *shortopts = "i:n:l:c:m:s:f:I:S:O:Ch";
 
 	while (true) {
 		opt = getopt_long(argc, argv, shortopts, longopts, &long_index);
@@ -699,6 +768,9 @@ static parse_result_t parse_options(int argc, char **argv, prog_config_t *config
 			break;
 		case 'O':
 			config->num_output_qs = atoi(optarg);
+			break;
+		case 'C':
+			config->is_cls_in_use = true;
 			break;
 		case 'h':
 			print_usage();
@@ -757,7 +829,7 @@ static odp_bool_t setup_pktios(prog_config_t *config)
 	pool_param.pkt.len = config->pkt_len;
 	pool_param.pkt.num = config->num_pkts;
 	pool_param.type = ODP_POOL_PACKET;
-	config->pktio_pool = odp_pool_create(PROG_NAME, &pool_param);
+	config->pktio_pool = odp_pool_create(SHORT_PROG_NAME "_pktio", &pool_param);
 
 	if (config->pktio_pool == ODP_POOL_INVALID) {
 		ODPH_ERR("Error creating packet I/O pool\n");
@@ -803,7 +875,9 @@ static odp_bool_t setup_pktios(prog_config_t *config)
 		if (config->mode == ORDERED)
 			pktin_param.queue_param.sched.sync = ODP_SCHED_SYNC_ORDERED;
 
-		if (config->num_input_qs > 1U) {
+		if (config->is_cls_in_use) {
+			pktin_param.classifier_enable = true;
+		} else if (config->num_input_qs > 1U) {
 			pktin_param.hash_enable = true;
 			pktin_param.hash_proto.proto.ipv4_udp = 1U;
 			pktin_param.num_queues = config->num_input_qs;
@@ -862,6 +936,147 @@ static odp_bool_t setup_pktios(prog_config_t *config)
 	}
 
 	return true;
+}
+
+static odp_bool_t setup_default_cos(prog_config_t *config)
+{
+	const char *name = SHORT_PROG_NAME "_def_cos";
+	odp_pool_param_t pool_param;
+	odp_queue_param_t q_param;
+	odp_cls_cos_param_t cls_param;
+
+	odp_pool_param_init(&pool_param);
+	pool_param.pkt.seg_len = config->pkt_len;
+	pool_param.pkt.len = config->pkt_len;
+	pool_param.pkt.num = config->num_pkts;
+	pool_param.type = ODP_POOL_PACKET;
+	config->cos_config.def_pool = odp_pool_create(name, &pool_param);
+
+	if (config->cos_config.def_pool == ODP_POOL_INVALID) {
+		ODPH_ERR("Error creating pool for default CoS\n");
+		return false;
+	}
+
+	odp_queue_param_init(&q_param);
+	odp_cls_cos_param_init(&cls_param);
+	q_param.type = ODP_QUEUE_TYPE_SCHED;
+	q_param.sched.prio = odp_schedule_default_prio();
+	q_param.sched.sync = config->mode == ORDERED ? ODP_SCHED_SYNC_ORDERED :
+						       ODP_SCHED_SYNC_PARALLEL;
+	q_param.sched.group = ODP_SCHED_GROUP_ALL;
+
+	if (config->num_cls_hash_qs > 1U) {
+		cls_param.num_queue = config->num_cls_hash_qs;
+		cls_param.queue_param = q_param;
+		cls_param.hash_proto.proto.ipv4_udp = 1U;
+	} else {
+		config->cos_config.def_queue = odp_queue_create(name, &q_param);
+
+		if (config->cos_config.def_queue == ODP_QUEUE_INVALID) {
+			ODPH_ERR("Error creating queue for default CoS\n");
+			return false;
+		}
+
+		cls_param.queue = config->cos_config.def_queue;
+	}
+
+	cls_param.pool = config->cos_config.def_pool;
+	config->cos_config.def_cos = odp_cls_cos_create(name, &cls_param);
+
+	if (config->cos_config.def_cos == ODP_COS_INVALID) {
+		ODPH_ERR("Error creating default CoS\n");
+		return false;
+	}
+
+	for (uint32_t i = 0U; i < config->num_ifs; ++i) {
+		if (odp_pktio_default_cos_set(config->pktios[i].handle,
+					      config->cos_config.def_cos) < 0) {
+			ODPH_ERR("Error setting default CoS for packet I/O (%s)\n",
+				 config->pktios[i].name);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static odp_bool_t create_and_attach_spi_cos(cos_t *cos, odp_cos_t def_cos, uint8_t mode,
+					    uint16_t spi)
+{
+	odp_queue_param_t q_param;
+	odp_cls_cos_param_t cls_param;
+	char q_name[ODP_QUEUE_NAME_LEN];
+	char cos_name[ODP_COS_NAME_LEN];
+	odp_pmr_param_t pmr_param;
+	odp_u32be_t val, mask;
+
+	odp_queue_param_init(&q_param);
+	odp_cls_cos_param_init(&cls_param);
+	snprintf(q_name, sizeof(q_name), SHORT_PROG_NAME "_cos_%u", spi);
+	snprintf(cos_name, sizeof(cos_name), SHORT_PROG_NAME "_cos_%u", spi);
+	q_param.type = ODP_QUEUE_TYPE_SCHED;
+	q_param.sched.prio = odp_schedule_default_prio();
+	q_param.sched.sync = mode == ORDERED ? ODP_SCHED_SYNC_ORDERED : ODP_SCHED_SYNC_PARALLEL;
+	q_param.sched.group = ODP_SCHED_GROUP_ALL;
+	cos->queue = odp_queue_create(q_name, &q_param);
+
+	if (cos->queue == ODP_QUEUE_INVALID) {
+		ODPH_ERR("Error creating queue for SPI CoS: %u\n", spi);
+		return false;
+	}
+
+	cls_param.queue = cos->queue;
+	cls_param.pool = cos->pool;
+	cos->cos = odp_cls_cos_create(cos_name, &cls_param);
+
+	if (cos->cos == ODP_COS_INVALID) {
+		ODPH_ERR("Error creating SPI CoS: %u\n", spi);
+		(void)odp_queue_destroy(cos->queue);
+		return false;
+	}
+
+	odp_cls_pmr_param_init(&pmr_param);
+	val = odp_cpu_to_be_32(spi);
+	mask = odp_cpu_to_be_32(0xFFFFFFFFU);
+	pmr_param.term = ODP_PMR_IPSEC_SPI;
+	pmr_param.match.value = &val;
+	pmr_param.match.mask = &mask;
+	pmr_param.val_sz = sizeof(val);
+	cos->pmr = odp_cls_pmr_create(&pmr_param, 1, def_cos, cos->cos);
+
+	if (cos->pmr == ODP_PMR_INVALID) {
+		ODPH_ERR("Error creating PMR for SPI CoS: %u\n", spi);
+		(void)odp_cos_destroy(cos->cos);
+		(void)odp_queue_destroy(cos->queue);
+		return false;
+	}
+
+	return true;
+}
+
+static odp_bool_t setup_cos(prog_config_t *config)
+{
+	cos_t *cos;
+
+	for (uint32_t i = 0U; i < MAX_SPIS; ++i) {
+		if (spi_to_sa_map[DIR_IN][i] != NULL) {
+			cos = &config->cos_config.cos[config->cos_config.num_cos];
+			cos->pool = config->cos_config.def_pool;
+
+			if (!create_and_attach_spi_cos(cos, config->cos_config.def_cos,
+						       config->mode, i))
+				return false;
+
+			++config->cos_config.num_cos;
+		}
+	}
+
+	return true;
+}
+
+static odp_bool_t setup_classifier(prog_config_t *config)
+{
+	return setup_default_cos(config) && setup_cos(config);
 }
 
 static odp_bool_t setup_fwd_table(prog_config_t *config)
@@ -1203,6 +1418,9 @@ static odp_bool_t setup_test(prog_config_t *config)
 	if (!setup_pktios(config))
 		return false;
 
+	if (config->is_cls_in_use && !setup_classifier(config))
+		return false;
+
 	if (!setup_fwd_table(config))
 		return false;
 
@@ -1222,6 +1440,24 @@ static void stop_test(prog_config_t *config)
 
 	odp_barrier_wait(&config->term_barrier);
 	(void)odph_thread_join(config->thread_tbl, config->num_thrs);
+}
+
+static void destroy_cos(const prog_config_t *config)
+{
+	for (uint32_t i = 0U; i < config->cos_config.num_cos; ++i) {
+		(void)odp_cls_pmr_destroy(config->cos_config.cos[i].pmr);
+		(void)odp_cos_destroy(config->cos_config.cos[i].cos);
+		(void)odp_queue_destroy(config->cos_config.cos[i].queue);
+	}
+
+	if (config->cos_config.def_cos != ODP_COS_INVALID)
+		(void)odp_cos_destroy(config->cos_config.def_cos);
+
+	if (config->cos_config.def_queue != ODP_QUEUE_INVALID)
+		(void)odp_queue_destroy(config->cos_config.def_queue);
+
+	if (config->cos_config.def_pool != ODP_POOL_INVALID)
+		(void)odp_pool_destroy(config->cos_config.def_pool);
 }
 
 static void wait_sas_disabled(uint32_t num_sas)
@@ -1256,6 +1492,7 @@ static void wait_sas_disabled(uint32_t num_sas)
 static void teardown_test(const prog_config_t *config)
 {
 	(void)odph_iplookup_table_destroy(config->fwd_tbl);
+	destroy_cos(config);
 
 	for (uint32_t i = 0U; i < config->num_ifs; ++i)
 		if (config->pktios[i].handle != ODP_PKTIO_INVALID) {
