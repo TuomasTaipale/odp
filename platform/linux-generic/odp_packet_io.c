@@ -2268,7 +2268,7 @@ int odp_pktin_queue_config(odp_pktio_t pktio,
 			if (param->queue_param_ovr)
 				queue_param_ovr = param->queue_param_ovr + i;
 
-			snprintf(name, sizeof(name), "odp-pktin-%i-%i",
+			snprintf(name, sizeof(name), "_odp_pktin_%i_%i",
 				 pktio_id, i);
 
 			if (param->classifier_enable) {
@@ -2494,7 +2494,7 @@ int odp_pktout_queue_config(odp_pktio_t pktio,
 			char name[ODP_QUEUE_NAME_LEN];
 			int pktio_id = odp_pktio_index(pktio);
 
-			snprintf(name, sizeof(name), "odp-pktout-%i-%i",
+			snprintf(name, sizeof(name), "_odp_pktout_%i_%i",
 				 pktio_id, i);
 
 			odp_queue_param_init(&queue_param);
