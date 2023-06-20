@@ -27,6 +27,7 @@
 	#define odp_event_type __odp_event_type
 	#define odp_event_type_multi __odp_event_type_multi
 	#define odp_event_user_area __odp_event_user_area
+	#define odp_event_user_area_and_flag __odp_event_user_area_and_flag
 	#define odp_event_subtype __odp_event_subtype
 	#define odp_event_types __odp_event_types
 	#define odp_event_flow_id __odp_event_flow_id
@@ -82,6 +83,42 @@ _ODP_INLINE void *odp_event_user_area(odp_event_t event)
 	default:
 		return NULL;
 	}
+}
+
+_ODP_INLINE void *odp_event_user_area_and_flag(odp_event_t event, int *val)
+{
+	const odp_event_type_t type = __odp_event_type_get(event);
+	_odp_packet_flags_t pkt_flags;
+	_odp_event_vector_flags_t vkt_flags;
+	void *area;
+	int flag = -1;
+
+	switch (type) {
+	case ODP_EVENT_BUFFER:
+	case ODP_EVENT_DMA_COMPL:
+		area = _odp_buffer_get((odp_buffer_t)event, void *, uarea_addr);
+		break;
+	case ODP_EVENT_PACKET:
+		area = _odp_pkt_get((odp_packet_t)event, void *, user_area);
+		pkt_flags.all_flags = _odp_pkt_get((odp_packet_t)event, uint32_t, flags);
+		flag = pkt_flags.user_flag;
+		break;
+	case ODP_EVENT_PACKET_VECTOR:
+		area = _odp_event_vect_get((odp_packet_vector_t)event, void *, uarea_addr);
+		vkt_flags.all_flags = _odp_event_vect_get((odp_packet_vector_t)event, uint32_t,
+							  flags);
+		flag = vkt_flags.user_flag;
+		break;
+	case ODP_EVENT_TIMEOUT:
+		area = _odp_timeout_hdr_field((odp_timeout_t)event, void *, uarea_addr);
+		break;
+	default:
+		area = NULL;
+	}
+
+	*val = flag;
+
+	return area;
 }
 
 _ODP_INLINE odp_event_subtype_t odp_event_subtype(odp_event_t event)
