@@ -3,12 +3,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2023 Nokia
 
-PCAP_IN=`find . ${TEST_DIR} $(dirname $0) -name udp64.pcap -print -quit`
+PCAP_IN=`find . ${TEST_DIR} $(dirname ${0}) -name udp64.pcap -print -quit`
 PCAP_OUT=dmafwd_out.pcap
 IF0=pcap:in=${PCAP_IN}:out=${PCAP_OUT}
 DUMP=tcpdump
 
-if [ "$0" = "$BASH_SOURCE" ]; then
+if [ "${0}" = "${BASH_SOURCE}" ]; then
 	echo "ERROR: Platform specific env file has to be sourced."
 fi
 
@@ -23,7 +23,7 @@ validate_result()
 		${DUMP} -r ${PCAP_IN} -t -x > ${VALIN}
 		${DUMP} -r ${PCAP_OUT} -t -x > ${VALOUT}
 		diff ${VALIN} ${VALOUT}
-		RET=$?
+		RET=${?}
 		rm -f ${VALIN}
 		rm -f ${VALOUT}
 	else
@@ -38,7 +38,7 @@ validate_result()
 
 	rm -f ${PCAP_OUT}
 
-	if [ $RET -ne 0 ]; then
+	if [ ${RET} -ne 0 ]; then
 		echo "ERROR: Input and output captures do not match"
 		return 1
 	fi
