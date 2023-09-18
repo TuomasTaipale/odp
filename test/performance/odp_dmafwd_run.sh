@@ -8,6 +8,8 @@ TEST_SRC_DIR=$(dirname ${0})
 PERF_TEST_DIR=platform/${ODP_PLATFORM}/test/performance
 PERF_TEST_DIR=${TEST_SRC_DIR}/../../${PERF_TEST_DIR}
 
+ENV=pktio_env
+DIR=dmafwd
 BIN_NAME=odp_dmafwd
 BATCH=10
 TIME=2
@@ -15,16 +17,16 @@ TESTS_RUN=0
 
 check_env()
 {
-	if [ -f "./pktio_env" ]; then
-		. ./pktio_env
+	if [ -f "./${ENV}" ]; then
+		. ./${ENV}
 	elif  [ "${ODP_PLATFORM}" = "" ]; then
 		echo "${0}: ERROR: ODP_PLATFORM must be defined"
 		exit 1
-	elif [ -f ${PERF_TEST_DIR}/dmafwd/pktio_env ]; then
-		. ${PERF_TEST_DIR}/dmafwd/pktio_env
+	elif [ -f ${PERF_TEST_DIR}/${DIR}/${ENV} ]; then
+		. ${PERF_TEST_DIR}/${DIR}/${ENV}
 	else
-		echo "ERROR: unable to find pktio_env"
-		echo "pktio_env has to be in current directory or in platform/\$ODP_PLATFORM/test/"
+		echo "ERROR: unable to find ${ENV}"
+		echo "${ENV} has to be in current directory or in platform/\$ODP_PLATFORM/test/"
 		echo "ODP_PLATFORM=\"${ODP_PLATFORM}\""
 		exit 1
 	fi
