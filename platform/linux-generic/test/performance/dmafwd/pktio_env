@@ -39,8 +39,8 @@ validate_result()
 	rm -f ${PCAP_OUT}
 
 	if [ $RET -ne 0 ]; then
-		echo "ERROR: Input and output captures do not match, exiting"
-		exit 1
+		echo "ERROR: Input and output captures do not match"
+		return 1
 	fi
 
 	return 0

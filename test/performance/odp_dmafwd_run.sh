@@ -35,8 +35,8 @@ check_result()
 	if [ $1 -eq 0 ]; then
 		TESTS_RUN=`expr $TESTS_RUN + 1`
 	elif [ $1 -eq 1 ]; then
-		echo "Test FAILED, exiting"
-		exit 1
+		echo "Test FAILED"
+		return 1
 	else
 		echo "Test SKIPPED"
 		return 0
@@ -60,9 +60,21 @@ echo "${BIN_NAME}: SW copy"
 echo "==================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 0
 check_result $?
+
+if [ ${?} -ne 0 ]; then
+	cleanup_interfaces
+	exit 1
+fi
+
 echo "${BIN_NAME}: DMA copy"
 echo "===================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 1
 check_result $?
+
+if [ ${?} -ne 0 ]; then
+	cleanup_interfaces
+	exit 1
+fi
+
 cleanup_interfaces
 check_exit
