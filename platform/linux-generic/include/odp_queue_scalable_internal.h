@@ -47,7 +47,7 @@ struct ODP_ALIGNED_CACHE queue_entry_s {
 	TAILQ_HEAD(poll_jobs_s, poll_job_s) jobs;
 
 	odp_ticketlock_t   job_lock;
-	uint32_t           num_jobs;
+	odp_atomic_u32_t   num_jobs;
 	uint32_t           index;
 	odp_queue_t        handle;
 	odp_queue_type_t   type;

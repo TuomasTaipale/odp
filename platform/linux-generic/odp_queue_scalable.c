@@ -139,6 +139,7 @@ static int queue_init(queue_entry_t *queue, const char *name,
 	sched_elem->qschst.wrr_budget = CONFIG_WRR_WEIGHT;
 	sched_elem->qschst.cur_ticket = 0;
 	sched_elem->qschst.nxt_ticket = 0;
+	sched_elem->sched_wait = 0;
 	sched_elem->pop_deficit = 0;
 	if (queue->type == ODP_QUEUE_TYPE_SCHED)
 		sched_elem->qschst_type = queue->param.sched.sync;
@@ -162,7 +163,7 @@ static int queue_init(queue_entry_t *queue, const char *name,
 #endif
 	TAILQ_INIT(&queue->jobs);
 	odp_ticketlock_init(&queue->job_lock);
-	queue->num_jobs = 0;
+	odp_atomic_init_u32(&queue->num_jobs, 0);
 
 	/* Queue initialized successfully, add it to the sched group */
 	if (queue->type == ODP_QUEUE_TYPE_SCHED) {
@@ -502,7 +503,7 @@ static int queue_destroy(odp_queue_t handle)
 	for (poll_job_t *job = queue->jobs.tqh_first; job != NULL; job = job->j.tqe_next)
 		TAILQ_REMOVE(&queue->jobs, job, j);
 
-	queue->num_jobs = 0;
+	odp_atomic_store_u32(&queue->num_jobs, 0);
 	UNLOCK(&queue->lock);
 	return 0;
 }
@@ -687,6 +688,7 @@ static int _queue_enq_multi(odp_queue_t handle, _odp_event_hdr_t *event_hdr[],
 
 #ifdef CONFIG_QSCHST_LOCK
 	LOCK(&queue->sched_elem.qschlock);
+
 	actual = _odp_queue_enq_sp(&queue->sched_elem, event_hdr, num);
 #else
 	actual = _odp_queue_enq(&queue->sched_elem, event_hdr, num);
@@ -752,7 +754,7 @@ static int queue_poll_jobs(odp_queue_t handle, _odp_event_hdr_t **event_hdr, int
 
 		if (num_deq == QPJ_DONE) {
 			TAILQ_REMOVE(&queue->jobs, job, j);
-			--queue->num_jobs;
+			odp_atomic_dec_u32(&queue->num_jobs);
 			continue;
 		} else {
 			/* Job isn't removed, move to last to give other jobs a chance to get
@@ -764,13 +766,13 @@ static int queue_poll_jobs(odp_queue_t handle, _odp_event_hdr_t **event_hdr, int
 		break;
 	}
 
-	if (queue->num_jobs == 0)
+	odp_ticketlock_unlock(&queue->job_lock);
+
+	if (odp_atomic_load_u32(&queue->num_jobs) == 0)
 		ret = QPJ_DONE;
 
 	if (num_deq > 0)
 		ret = num_deq;
-
-	odp_ticketlock_unlock(&queue->job_lock);
 
 	return ret;
 }
@@ -778,7 +780,7 @@ static int queue_poll_jobs(odp_queue_t handle, _odp_event_hdr_t **event_hdr, int
 /* Single-consumer dequeue. */
 int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 {
-	int actual;
+	int actual, num_deq;
 	ringidx_t old_read;
 	ringidx_t old_write;
 	ringidx_t new_read;
@@ -791,8 +793,29 @@ int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 	old_write = __atomic_load_n(&q->cons_write, __ATOMIC_ACQUIRE);
 	actual    = _ODP_MIN(num, (int)(old_write - old_read));
 
-	if (odp_unlikely(actual <= 0))
-		return 0;
+	if (odp_unlikely(actual <= 0)) {
+#ifdef CONFIG_QSCHST_LOCK
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_unlock(&q->qschlock);
+
+		num_deq = queue_poll_jobs(((queue_entry_t *)q)->handle, (_odp_event_hdr_t **)evp,
+					  num);
+
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_lock(&q->qschlock);
+#else
+		num_deq = queue_poll_jobs(((queue_entry_t *)q)->handle, (_odp_event_hdr_t **)evp,
+					  num);
+#endif
+		if (num_deq > 0) {
+			q->qschst.numevts += num_deq;
+
+			if (q->cons_type != ODP_SCHED_SYNC_ATOMIC)
+				q->qschst.wrr_budget += num_deq;
+		}
+
+		return num_deq;
+	}
 
 #ifdef CONFIG_SPLIT_PRODCONS
 	__builtin_prefetch(&q->node, 1, 0);
@@ -815,6 +838,31 @@ int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 	/* Wait for loads (from ring slots) to complete. */
 	atomic_store_release(&q->prod_read, new_read, /*readonly=*/true);
 #endif
+	if (actual < num) {
+#ifdef CONFIG_QSCHST_LOCK
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_unlock(&q->qschlock);
+
+		num_deq = queue_poll_jobs(((queue_entry_t *)q)->handle,
+					  &((_odp_event_hdr_t **)evp)[actual], num - actual);
+
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_lock(&q->qschlock);
+#else
+		num_deq = queue_poll_jobs(((queue_entry_t *)q)->handle,
+					  &((_odp_event_hdr_t **)evp)[actual], num - actual);
+#endif
+		if (num_deq < 0) {
+			if (actual == 0)
+				actual = num_deq;
+		} else {
+			q->qschst.numevts += num_deq;
+			actual += num_deq;
+
+			if (q->cons_type != ODP_SCHED_SYNC_ATOMIC)
+				q->qschst.wrr_budget += num_deq;
+		}
+	}
 
 	return actual;
 }
@@ -888,7 +936,7 @@ int _odp_queue_deq(sched_elem_t *q, _odp_event_hdr_t *event_hdr[], int num)
 
 int _odp_queue_deq_mc(sched_elem_t *q, odp_event_t *evp, int num)
 {
-	int ret, evt_idx;
+	int ret, evt_idx, num_deq;
 	_odp_event_hdr_t *hdr_tbl[QUEUE_MULTI_MAX];
 
 	if (num > QUEUE_MULTI_MAX)
@@ -898,6 +946,22 @@ int _odp_queue_deq_mc(sched_elem_t *q, odp_event_t *evp, int num)
 	if (odp_likely(ret != 0)) {
 		for (evt_idx = 0; evt_idx < num; evt_idx++)
 			evp[evt_idx] = _odp_event_from_hdr(hdr_tbl[evt_idx]);
+	}
+
+	if (ret < num) {
+		num_deq = queue_poll_jobs(((queue_entry_t *)q)->handle,
+					  &((_odp_event_hdr_t **)evp)[ret], num - ret);
+
+		if (num_deq < 0) {
+			if (ret == 0)
+				ret = num_deq;
+		} else {
+			q->qschst.numevts += num_deq;
+			ret += num_deq;
+
+			if (q->cons_type != ODP_SCHED_SYNC_ATOMIC)
+				q->qschst.wrr_budget += num_deq;
+		}
 	}
 
 	return ret;
@@ -1227,8 +1291,11 @@ static int queue_add_poll_job(odp_queue_t handle, poll_job_t *job)
 
 	odp_ticketlock_lock(&queue->job_lock);
 	TAILQ_INSERT_TAIL(&queue->jobs, job, j);
-	++queue->num_jobs;
+	odp_atomic_inc_u32(&queue->num_jobs);
 	odp_ticketlock_unlock(&queue->job_lock);
+
+	if (queue->type == ODP_QUEUE_TYPE_SCHED && _odp_sched_fn->sched_queue(handle))
+		return -1;
 
 	return 0;
 }

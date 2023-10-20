@@ -359,7 +359,7 @@ static odp_queue_t queue_create(const char *name,
 		return ODP_QUEUE_INVALID;
 
 	if (type == ODP_QUEUE_TYPE_SCHED) {
-		if (_odp_sched_fn->create_queue(queue->index,
+		if (_odp_sched_fn->create_queue(queue->handle,
 						&queue->param.sched)) {
 			queue->status = QUEUE_STATUS_FREE;
 			_ODP_ERR("schedule queue init failed\n");
@@ -445,7 +445,7 @@ static int queue_destroy(odp_queue_t handle)
 		break;
 	case QUEUE_STATUS_NOTSCHED:
 		queue->status = QUEUE_STATUS_FREE;
-		_odp_sched_fn->destroy_queue(queue->index);
+		_odp_sched_fn->destroy_queue(handle);
 		break;
 	case QUEUE_STATUS_SCHED:
 		/* Queue is still in scheduling */
@@ -461,7 +461,7 @@ static int queue_destroy(odp_queue_t handle)
 	for (poll_job_t *job = queue->jobs.tqh_first; job != NULL; job = job->j.tqe_next)
 		TAILQ_REMOVE(&queue->jobs, job, j);
 
-	queue->num_jobs = 0;
+	odp_atomic_store_u32(&queue->num_jobs, 0);
 	UNLOCK(queue);
 
 	return 0;
@@ -548,7 +548,7 @@ static int queue_poll_jobs(odp_queue_t handle, _odp_event_hdr_t **event_hdr, int
 
 		if (num_deq == QPJ_DONE) {
 			TAILQ_REMOVE(&queue->jobs, job, j);
-			--queue->num_jobs;
+			odp_atomic_dec_u32(&queue->num_jobs);
 			continue;
 		} else {
 			/* Job isn't removed, move to last to give other jobs a chance to get
@@ -560,13 +560,13 @@ static int queue_poll_jobs(odp_queue_t handle, _odp_event_hdr_t **event_hdr, int
 		break;
 	}
 
-	if (queue->num_jobs == 0)
+	odp_ticketlock_unlock(&queue->job_lock);
+
+	if (odp_atomic_load_u32(&queue->num_jobs) == 0)
 		ret = QPJ_DONE;
 
 	if (num_deq > 0)
 		ret = num_deq;
-
-	odp_ticketlock_unlock(&queue->job_lock);
 
 	return ret;
 }
@@ -992,7 +992,7 @@ static inline int _sched_queue_enq_multi(odp_queue_t handle,
 	UNLOCK(queue);
 
 	/* Add queue to scheduling */
-	if (sched && _odp_sched_fn->sched_queue(queue->index))
+	if (sched && _odp_sched_fn->sched_queue(handle))
 		_ODP_ABORT("schedule_queue failed\n");
 
 	return num_enq;
@@ -1001,7 +1001,7 @@ static inline int _sched_queue_enq_multi(odp_queue_t handle,
 int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num,
 			 int update_status)
 {
-	int num_deq, status;
+	int num_deq, status, num_enq;
 	ring_st_t *ring_st;
 	queue_entry_t *queue = qentry_from_index(queue_index);
 	uint32_t event_idx[max_num];
@@ -1017,7 +1017,7 @@ int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num,
 		 * Inform scheduler about a destroyed queue. */
 		if (queue->status == QUEUE_STATUS_DESTROYED) {
 			queue->status = QUEUE_STATUS_FREE;
-			_odp_sched_fn->destroy_queue(queue_index);
+			_odp_sched_fn->destroy_queue(queue->handle);
 		}
 
 		UNLOCK(queue);
@@ -1027,8 +1027,16 @@ int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num,
 	num_deq = ring_st_deq_multi(ring_st, queue->ring_data,
 				    queue->ring_mask, event_idx, max_num);
 
-	if (num_deq == 0) {
-		/* Already empty queue */
+	if (num_deq > 0) {
+		UNLOCK(queue);
+
+		event_index_to_hdr((_odp_event_hdr_t **)ev, event_idx, num_deq);
+
+		return num_deq;
+	}
+
+	if (odp_atomic_load_u32(&queue->num_jobs) == 0) {
+		/* Empty queue and no jobs to process */
 		if (update_status && status == QUEUE_STATUS_SCHED)
 			queue->status = QUEUE_STATUS_NOTSCHED;
 
@@ -1039,7 +1047,31 @@ int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num,
 
 	UNLOCK(queue);
 
-	event_index_to_hdr((_odp_event_hdr_t **)ev, event_idx, num_deq);
+	num_deq = queue_poll_jobs(queue->handle, (_odp_event_hdr_t **)ev, max_num);
+
+	if (num_deq <= 0) {
+		LOCK(queue);
+
+		if (num_deq == QPJ_DONE && queue->status == QUEUE_STATUS_SCHED)
+			queue->status = QUEUE_STATUS_NOTSCHED;
+
+		UNLOCK(queue);
+
+		return num_deq;
+	}
+
+	if (queue->param.sched.sync == ODP_SCHED_SYNC_ORDERED) {
+		num_enq = odp_queue_enq_multi(queue->handle, ev, num_deq);
+
+		if (odp_unlikely(num_enq < num_deq)) {
+			num_enq = num_enq < 0 ? 0 : num_enq;
+			_odp_event_free_multi((_odp_event_hdr_t **)&ev[num_enq],
+					      num_deq - num_enq);
+			_ODP_DBG("Dropped %d events\n", num_deq - num_enq);
+		}
+
+		return QPJ_KEEP;
+	}
 
 	return num_deq;
 }
@@ -1075,7 +1107,7 @@ int _odp_sched_queue_empty(uint32_t queue_index)
 		return -1;
 	}
 
-	if (ring_st_is_empty(&queue->ring_st)) {
+	if (ring_st_is_empty(&queue->ring_st) && odp_atomic_load_u32(&queue->num_jobs) == 0) {
 		/* Already empty queue. Update status. */
 		if (queue->status == QUEUE_STATUS_SCHED)
 			queue->status = QUEUE_STATUS_NOTSCHED;
@@ -1176,7 +1208,7 @@ static int queue_init(queue_entry_t *queue, const char *name,
 
 	TAILQ_INIT(&queue->jobs);
 	odp_ticketlock_init(&queue->job_lock);
-	queue->num_jobs = 0;
+	odp_atomic_init_u32(&queue->num_jobs, 0);
 
 	return 0;
 }
@@ -1280,8 +1312,15 @@ static int queue_add_poll_job(odp_queue_t handle, poll_job_t *job)
 
 	odp_ticketlock_lock(&queue->job_lock);
 	TAILQ_INSERT_TAIL(&queue->jobs, job, j);
-	++queue->num_jobs;
+	odp_atomic_inc_u32(&queue->num_jobs);
 	odp_ticketlock_unlock(&queue->job_lock);
+
+	if (queue->type == ODP_QUEUE_TYPE_SCHED) {
+		_odp_sched_queue_set_status(queue->index, QUEUE_STATUS_SCHED);
+
+		if (_odp_sched_fn->sched_queue(handle))
+			return -1;
+	}
 
 	return 0;
 }

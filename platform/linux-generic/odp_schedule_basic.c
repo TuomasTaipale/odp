@@ -868,13 +868,14 @@ static uint8_t allocate_spread(int grp, int prio)
 	return spr;
 }
 
-static int schedule_create_queue(uint32_t queue_index,
+static int schedule_create_queue(odp_queue_t queue,
 				 const odp_schedule_param_t *sched_param)
 {
 	int i;
 	uint8_t spread;
 	int grp  = sched_param->group;
 	int prio = prio_level_from_api(sched_param->prio);
+	uint32_t queue_index = queue_to_index(queue);
 
 	if (odp_global_rw->schedule_configured == 0) {
 		_ODP_ERR("Scheduler has not been configured\n");
@@ -935,8 +936,10 @@ static inline uint8_t sched_sync_type(uint32_t queue_index)
 	return sched->queue[queue_index].sync;
 }
 
-static void schedule_destroy_queue(uint32_t queue_index)
+static void schedule_destroy_queue(odp_queue_t queue)
 {
+	uint32_t queue_index = queue_to_index(queue);
+
 	int grp  = sched->queue[queue_index].grp;
 	int prio = sched->queue[queue_index].prio;
 	int spread = sched->queue[queue_index].spread;
@@ -957,8 +960,10 @@ static void schedule_destroy_queue(uint32_t queue_index)
 		_ODP_ERR("queue reorder incomplete\n");
 }
 
-static int schedule_sched_queue(uint32_t queue_index)
+static int schedule_sched_queue(odp_queue_t queue)
 {
+	uint32_t queue_index = queue_to_index(queue);
+
 	int grp      = sched->queue[queue_index].grp;
 	int prio     = sched->queue[queue_index].prio;
 	int spread   = sched->queue[queue_index].spread;
@@ -986,7 +991,7 @@ static void schedule_pktio_start(int pktio_index, int num_pktin,
 
 		/* Start polling */
 		_odp_sched_queue_set_status(qi, QUEUE_STATUS_SCHED);
-		schedule_sched_queue(qi);
+		schedule_sched_queue(queue_from_index(qi));
 	}
 }
 
@@ -1423,6 +1428,13 @@ static inline int schedule_grp_prio(odp_queue_t *out_queue, odp_event_t out_ev[]
 		num = _odp_sched_queue_deq(qi, ev_tbl, max_deq, !pktin);
 
 		if (odp_unlikely(num < 0)) {
+			if (num == QPJ_KEEP) {
+				/* Queue with pollable jobs, keep scheduled and move to next
+				 * spread */
+				ring_u32_enq(ring, ring_mask, qi);
+				i++;
+				spr++;
+			}
 			/* Remove destroyed queue from scheduling. Continue scheduling
 			 * the same group/prio/spread. */
 			continue;

@@ -162,7 +162,6 @@ typedef struct ODP_ALIGNED_CACHE {
 		odp_queue_t        queue;
 		odp_pktout_queue_t pktout;
 	} out_queue[ODP_PKTOUT_MAX_QUEUES];
-
 } pktio_entry_t;
 
 typedef struct {
