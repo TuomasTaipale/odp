@@ -44,6 +44,10 @@ struct ODP_ALIGNED_CACHE queue_entry_s {
 	queue_deq_multi_fn_t dequeue_multi;
 	queue_deq_multi_fn_t orig_dequeue_multi;
 
+	TAILQ_HEAD(poll_jobs_s, poll_job_s) jobs;
+
+	odp_ticketlock_t   job_lock;
+	uint32_t           num_jobs;
 	uint32_t           index;
 	odp_queue_t        handle;
 	odp_queue_type_t   type;

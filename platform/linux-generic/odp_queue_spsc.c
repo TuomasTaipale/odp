@@ -102,7 +102,17 @@ static int queue_spsc_enq(odp_queue_t handle, _odp_event_hdr_t *event_hdr)
 static int queue_spsc_deq_multi(odp_queue_t handle, _odp_event_hdr_t *event_hdr[],
 				int num)
 {
-	return spsc_deq_multi(handle, event_hdr, num);
+	int num_deq, ret = 0;
+
+	num_deq = spsc_deq_multi(handle, event_hdr, num);
+	ret += num_deq < 0 ? 0 : num_deq;
+
+	if (num_deq < num) {
+		num_deq = _odp_queue_fn->poll_jobs(handle, &event_hdr[ret], num - ret);
+		ret += num_deq < 0 ? 0 : num_deq;
+	}
+
+	return ret;
 }
 
 static _odp_event_hdr_t *queue_spsc_deq(odp_queue_t handle)
@@ -110,7 +120,7 @@ static _odp_event_hdr_t *queue_spsc_deq(odp_queue_t handle)
 	_odp_event_hdr_t *event_hdr = NULL;
 	int ret;
 
-	ret = spsc_deq_multi(handle, &event_hdr, 1);
+	ret = queue_spsc_deq_multi(handle, &event_hdr, 1);
 
 	if (ret == 1)
 		return event_hdr;

@@ -458,6 +458,10 @@ static int queue_destroy(odp_queue_t handle)
 	if (queue->queue_lf)
 		_odp_queue_lf_destroy(queue->queue_lf);
 
+	for (poll_job_t *job = queue->jobs.tqh_first; job != NULL; job = job->j.tqe_next)
+		TAILQ_REMOVE(&queue->jobs, job, j);
+
+	queue->num_jobs = 0;
 	UNLOCK(queue);
 
 	return 0;
@@ -532,6 +536,41 @@ static inline void event_index_to_hdr(_odp_event_hdr_t *event_hdr[],
 	}
 }
 
+static int queue_poll_jobs(odp_queue_t handle, _odp_event_hdr_t **event_hdr, int num)
+{
+	queue_entry_t *queue = qentry_from_handle(handle);
+	int num_deq = 0, ret = QPJ_KEEP;
+
+	odp_ticketlock_lock(&queue->job_lock);
+
+	for (poll_job_t *job = queue->jobs.tqh_first; job != NULL; job = job->j.tqe_next) {
+		num_deq = job->deq(queue->handle, event_hdr, num, job->data);
+
+		if (num_deq == QPJ_DONE) {
+			TAILQ_REMOVE(&queue->jobs, job, j);
+			--queue->num_jobs;
+			continue;
+		} else {
+			/* Job isn't removed, move to last to give other jobs a chance to get
+			 * polled */
+			TAILQ_REMOVE(&queue->jobs, job, j);
+			TAILQ_INSERT_TAIL(&queue->jobs, job, j);
+		}
+
+		break;
+	}
+
+	if (queue->num_jobs == 0)
+		ret = QPJ_DONE;
+
+	if (num_deq > 0)
+		ret = num_deq;
+
+	odp_ticketlock_unlock(&queue->job_lock);
+
+	return ret;
+}
+
 static inline int _plain_queue_enq_multi(odp_queue_t handle,
 					 _odp_event_hdr_t *event_hdr[], int num)
 {
@@ -597,7 +636,17 @@ static int plain_queue_enq(odp_queue_t handle, _odp_event_hdr_t *event_hdr)
 static int plain_queue_deq_multi(odp_queue_t handle,
 				 _odp_event_hdr_t *event_hdr[], int num)
 {
-	return _plain_queue_deq_multi(handle, event_hdr, num);
+	int num_deq, ret = 0;
+
+	num_deq = _plain_queue_deq_multi(handle, event_hdr, num);
+	ret += num_deq < 0 ? 0 : num_deq;
+
+	if (num_deq < num) {
+		num_deq = queue_poll_jobs(handle, &event_hdr[ret], num - ret);
+		ret += num_deq < 0 ? 0 : num_deq;
+	}
+
+	return ret;
 }
 
 static _odp_event_hdr_t *plain_queue_deq(odp_queue_t handle)
@@ -605,7 +654,7 @@ static _odp_event_hdr_t *plain_queue_deq(odp_queue_t handle)
 	_odp_event_hdr_t *event_hdr = NULL;
 	int ret;
 
-	ret = _plain_queue_deq_multi(handle, &event_hdr, 1);
+	ret = plain_queue_deq_multi(handle, &event_hdr, 1);
 
 	if (ret == 1)
 		return event_hdr;
@@ -1125,6 +1174,10 @@ static int queue_init(queue_entry_t *queue, const char *name,
 		}
 	}
 
+	TAILQ_INIT(&queue->jobs);
+	odp_ticketlock_init(&queue->job_lock);
+	queue->num_jobs = 0;
+
 	return 0;
 }
 
@@ -1221,6 +1274,18 @@ static void queue_timer_rem(odp_queue_t handle)
 	odp_atomic_dec_u64(&queue->num_timers);
 }
 
+static int queue_add_poll_job(odp_queue_t handle, poll_job_t *job)
+{
+	queue_entry_t *queue = qentry_from_handle(handle);
+
+	odp_ticketlock_lock(&queue->job_lock);
+	TAILQ_INSERT_TAIL(&queue->jobs, job, j);
+	++queue->num_jobs;
+	odp_ticketlock_unlock(&queue->job_lock);
+
+	return 0;
+}
+
 static int queue_api_enq(odp_queue_t handle, odp_event_t ev)
 {
 	queue_entry_t *queue = qentry_from_handle(handle);
@@ -1297,5 +1362,7 @@ queue_fn_t _odp_queue_basic_fn = {
 	.set_enq_deq_fn = queue_set_enq_deq_func,
 	.orig_deq_multi = queue_orig_multi,
 	.timer_add = queue_timer_add,
-	.timer_rem = queue_timer_rem
+	.timer_rem = queue_timer_rem,
+	.add_poll_job = queue_add_poll_job,
+	.poll_jobs = queue_poll_jobs
 };
