@@ -18,6 +18,7 @@ extern "C" {
 
 #include <odp_event_internal.h>
 #include <odp_forward_typedefs_internal.h>
+#include <odp_queue_poll_job.h>
 
 #define QUEUE_MULTI_MAX CONFIG_BURST_SIZE
 
@@ -58,6 +59,7 @@ typedef struct {
 	queue_set_enq_deq_fn_t set_enq_deq_fn;
 	queue_timer_add_fn_t timer_add;
 	queue_timer_rem_fn_t timer_rem;
+	_odp_qpj_add_fn_t add_poll_job;
 
 	/* Original queue dequeue multi function (before override). May be used
 	 * by an overriding dequeue function. */
