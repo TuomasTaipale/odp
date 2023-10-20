@@ -60,6 +60,15 @@ static inline void _odp_qpj_add(_odp_qpj_poll_jobs_t *jobs, _odp_qpj_poll_job_t 
 	odp_ticketlock_unlock(&jobs->lock);
 }
 
+/* Remove poll job from active polling list */
+static inline void _odp_qpj_rem(_odp_qpj_poll_jobs_t *jobs, _odp_qpj_poll_job_t *job)
+{
+	odp_ticketlock_lock(&jobs->lock);
+	TAILQ_REMOVE(&jobs->head, job, j);
+	odp_atomic_dec_u32(&jobs->num);
+	odp_ticketlock_unlock(&jobs->lock);
+}
+
 /* Destroy jobs, to be called during queue teardown. */
 static inline void _odp_qpj_destroy_jobs(_odp_qpj_poll_jobs_t *jobs)
 {
@@ -110,6 +119,11 @@ static inline int _odp_qpj_poll(_odp_qpj_poll_jobs_t *jobs, odp_queue_t queue,
 		ret = num_deq;
 
 	return ret;
+}
+
+static inline odp_bool_t _odp_qpj_has_jobs(_odp_qpj_poll_jobs_t *jobs)
+{
+	return odp_atomic_load_u32(&jobs->num) > 0U;
 }
 
 #ifdef __cplusplus
