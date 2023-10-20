@@ -170,7 +170,7 @@ static int queue_lf_enq_multi(odp_queue_t handle, _odp_event_hdr_t **event_hdr,
 	return 0;
 }
 
-static _odp_event_hdr_t *queue_lf_deq(odp_queue_t handle)
+static _odp_event_hdr_t *_queue_lf_deq(odp_queue_t handle)
 {
 	queue_entry_t *queue;
 	queue_lf_t *queue_lf;
@@ -235,6 +235,18 @@ static _odp_event_hdr_t *queue_lf_deq(odp_queue_t handle)
 	}
 
 	return NULL;
+}
+
+static _odp_event_hdr_t *queue_lf_deq(odp_queue_t handle)
+{
+	_odp_event_hdr_t *ev = NULL;
+
+	ev = _queue_lf_deq(handle);
+
+	if (ev == NULL)
+		(void)_odp_qpj_poll(&qentry_from_handle(handle)->wss, handle, &ev, 1);
+
+	return ev;
 }
 
 static int queue_lf_deq_multi(odp_queue_t handle, _odp_event_hdr_t **event_hdr,
