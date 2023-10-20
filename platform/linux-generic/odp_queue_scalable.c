@@ -139,6 +139,7 @@ static int queue_init(queue_entry_t *queue, const char *name,
 	sched_elem->qschst.wrr_budget = CONFIG_WRR_WEIGHT;
 	sched_elem->qschst.cur_ticket = 0;
 	sched_elem->qschst.nxt_ticket = 0;
+	sched_elem->sched_wait = 0;
 	sched_elem->pop_deficit = 0;
 	if (queue->type == ODP_QUEUE_TYPE_SCHED)
 		sched_elem->qschst_type = queue->param.sched.sync;
@@ -680,6 +681,7 @@ static int _queue_enq_multi(odp_queue_t handle, _odp_event_hdr_t *event_hdr[],
 
 #ifdef CONFIG_QSCHST_LOCK
 	LOCK(&queue->sched_elem.qschlock);
+
 	actual = _odp_queue_enq_sp(&queue->sched_elem, event_hdr, num);
 #else
 	actual = _odp_queue_enq(&queue->sched_elem, event_hdr, num);
@@ -736,12 +738,13 @@ static int queue_enq(odp_queue_t handle, odp_event_t ev)
 /* Single-consumer dequeue. */
 int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 {
-	int actual;
+	int actual, num_deq;
 	ringidx_t old_read;
 	ringidx_t old_write;
 	ringidx_t new_read;
 	uint32_t mask;
 	_odp_event_hdr_t **ring;
+	queue_entry_t *entry = (queue_entry_t *)q;
 
 	/* Load consumer ring state (read & write index). */
 	old_read  = q->cons_read;
@@ -749,8 +752,29 @@ int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 	old_write = __atomic_load_n(&q->cons_write, __ATOMIC_ACQUIRE);
 	actual    = _ODP_MIN(num, (int)(old_write - old_read));
 
-	if (odp_unlikely(actual <= 0))
-		return 0;
+	if (odp_unlikely(actual <= 0)) {
+#ifdef CONFIG_QSCHST_LOCK
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_unlock(&q->qschlock);
+
+		num_deq = _odp_qpj_poll(&entry->wss, entry->handle, (_odp_event_hdr_t **)evp,
+					num);
+
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_lock(&q->qschlock);
+#else
+		num_deq = _odp_qpj_poll(&entry->wss, entry->handle, (_odp_event_hdr_t **)evp,
+					num);
+#endif
+		if (num_deq > 0) {
+			q->qschst.numevts += num_deq;
+
+			if (q->cons_type != ODP_SCHED_SYNC_ATOMIC)
+				q->qschst.wrr_budget += num_deq;
+		}
+
+		return num_deq > 0 ? num_deq : num_deq == _ODP_QPJ_KEEP ? -2 : -1;
+	}
 
 #ifdef CONFIG_SPLIT_PRODCONS
 	__builtin_prefetch(&q->node, 1, 0);
@@ -773,6 +797,31 @@ int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 	/* Wait for loads (from ring slots) to complete. */
 	atomic_store_release(&q->prod_read, new_read, /*readonly=*/true);
 #endif
+	if (actual < num) {
+#ifdef CONFIG_QSCHST_LOCK
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_unlock(&q->qschlock);
+
+		num_deq = _odp_qpj_poll(&entry->wss, entry->handle,
+					&((_odp_event_hdr_t **)evp)[actual], num - actual);
+
+		if ((q->cons_type & FLAG_PKTIN) == 0)
+			odp_ticketlock_lock(&q->qschlock);
+#else
+		num_deq = _odp_qpj_poll(&entry->wss, entry->handle,
+					&((_odp_event_hdr_t **)evp)[actual], num - actual);
+#endif
+		if (_odp_qpj_is_err(num_deq)) {
+			if (actual == 0)
+				actual = num_deq == _ODP_QPJ_KEEP ? -2 : -1;
+		} else {
+			q->qschst.numevts += num_deq;
+			actual += num_deq;
+
+			if (q->cons_type != ODP_SCHED_SYNC_ATOMIC)
+				q->qschst.wrr_budget += num_deq;
+		}
+	}
 
 	return actual;
 }
@@ -846,8 +895,9 @@ int _odp_queue_deq(sched_elem_t *q, _odp_event_hdr_t *event_hdr[], int num)
 
 int _odp_queue_deq_mc(sched_elem_t *q, odp_event_t *evp, int num)
 {
-	int ret, evt_idx;
+	int ret, evt_idx, num_deq;
 	_odp_event_hdr_t *hdr_tbl[QUEUE_MULTI_MAX];
+	queue_entry_t *entry = (queue_entry_t *)q;
 
 	if (num > QUEUE_MULTI_MAX)
 		num = QUEUE_MULTI_MAX;
@@ -856,6 +906,22 @@ int _odp_queue_deq_mc(sched_elem_t *q, odp_event_t *evp, int num)
 	if (odp_likely(ret != 0)) {
 		for (evt_idx = 0; evt_idx < num; evt_idx++)
 			evp[evt_idx] = _odp_event_from_hdr(hdr_tbl[evt_idx]);
+	}
+
+	if (ret < num) {
+		num_deq = _odp_qpj_poll(&entry->wss, entry->handle,
+					&((_odp_event_hdr_t **)evp)[ret], num - ret);
+
+		if (_odp_qpj_is_err(num_deq)) {
+			if (ret == 0)
+				ret = num_deq == _ODP_QPJ_KEEP ? -2 : -1;
+		} else {
+			q->qschst.numevts += num_deq;
+			ret += num_deq;
+
+			if (q->cons_type != ODP_SCHED_SYNC_ATOMIC)
+				q->qschst.wrr_budget += num_deq;
+		}
 	}
 
 	return ret;
@@ -1184,6 +1250,9 @@ static int queue_add_poll_job(odp_queue_t handle, _odp_qpj_ws_data_t *data)
 	queue_entry_t *queue = qentry_from_int(handle);
 
 	_odp_qpj_add(&queue->wss, data);
+
+	if (queue->type == ODP_QUEUE_TYPE_SCHED)
+		(void)_odp_sched_fn->sched_queue(handle);
 
 	return 0;
 }
