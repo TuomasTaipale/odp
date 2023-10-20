@@ -597,7 +597,18 @@ static int plain_queue_enq(odp_queue_t handle, _odp_event_hdr_t *event_hdr)
 static int plain_queue_deq_multi(odp_queue_t handle,
 				 _odp_event_hdr_t *event_hdr[], int num)
 {
-	return _plain_queue_deq_multi(handle, event_hdr, num);
+	int num_tot = 0, num_deq;
+
+	num_deq = _plain_queue_deq_multi(handle, event_hdr, num);
+	num_tot += (num_deq > 0 ? num_deq : 0);
+
+	if (num_tot < num) {
+		num_deq = _odp_qpj_poll(&qentry_from_handle(handle)->wss, handle,
+					&event_hdr[num_tot], num - num_tot);
+		num_tot += (num_deq > 0 ? num_deq : 0);
+	}
+
+	return num_tot;
 }
 
 static _odp_event_hdr_t *plain_queue_deq(odp_queue_t handle)
@@ -605,7 +616,7 @@ static _odp_event_hdr_t *plain_queue_deq(odp_queue_t handle)
 	_odp_event_hdr_t *event_hdr = NULL;
 	int ret;
 
-	ret = _plain_queue_deq_multi(handle, &event_hdr, 1);
+	ret = plain_queue_deq_multi(handle, &event_hdr, 1);
 
 	if (ret == 1)
 		return event_hdr;
@@ -1125,6 +1136,8 @@ static int queue_init(queue_entry_t *queue, const char *name,
 		}
 	}
 
+	_odp_qpj_init_wss(&queue->wss);
+
 	return 0;
 }
 
@@ -1221,6 +1234,15 @@ static void queue_timer_rem(odp_queue_t handle)
 	odp_atomic_dec_u64(&queue->num_timers);
 }
 
+static int queue_add_poll_job(odp_queue_t handle, _odp_qpj_ws_data_t *data)
+{
+	queue_entry_t *queue = qentry_from_handle(handle);
+
+	_odp_qpj_add(&queue->wss, data);
+
+	return 0;
+}
+
 static int queue_api_enq(odp_queue_t handle, odp_event_t ev)
 {
 	queue_entry_t *queue = qentry_from_handle(handle);
@@ -1297,5 +1319,6 @@ queue_fn_t _odp_queue_basic_fn = {
 	.set_enq_deq_fn = queue_set_enq_deq_func,
 	.orig_deq_multi = queue_orig_multi,
 	.timer_add = queue_timer_add,
-	.timer_rem = queue_timer_rem
+	.timer_rem = queue_timer_rem,
+	.add_poll_job = queue_add_poll_job
 };
