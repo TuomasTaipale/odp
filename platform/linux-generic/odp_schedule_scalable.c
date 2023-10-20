@@ -45,8 +45,7 @@
 #define UNLOCK(a) odp_ticketlock_unlock((a))
 
 #define MAXTHREADS ATOM_BITSET_SIZE
-
-#define FLAG_PKTIN 0x80
+#define SCHED_WAIT 2
 
 ODP_STATIC_ASSERT(_ODP_CHECK_IS_POWER2(CONFIG_MAX_SCHED_QUEUES),
 		  "Number_of_queues_is_not_power_of_two");
@@ -309,6 +308,7 @@ sched_update_deq(sched_elem_t *q,
 {
 	qschedstate_t oss, nss;
 	uint32_t ticket;
+	odp_bool_t has_jobs = _odp_qpj_has_jobs(&((queue_entry_t *)q)->wss);
 
 	if (atomic) {
 		bool pushed = false;
@@ -324,7 +324,7 @@ sched_update_deq(sched_elem_t *q,
 			_ODP_ASSERT(oss.cur_ticket == _odp_sched_ts->ticket);
 			nss = oss;
 			nss.numevts -= actual;
-			if (nss.numevts > 0 && !pushed) {
+			if ((nss.numevts > 0 || has_jobs) && !pushed) {
 				schedq_push(q->schedq, q);
 				pushed = true;
 			}
@@ -381,7 +381,7 @@ sched_update_deq(sched_elem_t *q,
 		 * was exhausted, the queue needs to be moved (popped and
 		 * pushed) to the tail of the schedq
 		 */
-		if (oss.numevts > 0 && nss.numevts <= 0) {
+		if (oss.numevts > 0 && nss.numevts <= 0 && !has_jobs) {
 			/* NE->E transition, need to pop */
 			if (!schedq_elem_on_queue(q) ||
 			    !schedq_cond_pop(q->schedq, q)) {
@@ -421,13 +421,14 @@ sched_update_deq_sc(sched_elem_t *q,
 {
 	qschedstate_t oss, nss;
 	uint32_t ticket;
+	odp_bool_t has_jobs = _odp_qpj_has_jobs(&((queue_entry_t *)q)->wss);
 
 	if (atomic) {
 		_ODP_ASSERT(q->qschst.cur_ticket == _odp_sched_ts->ticket);
 		_ODP_ASSERT(q->qschst.cur_ticket != q->qschst.nxt_ticket);
 		q->qschst.numevts -= actual;
 		q->qschst.cur_ticket = _odp_sched_ts->ticket + 1;
-		if (q->qschst.numevts > 0)
+		if (q->qschst.numevts > 0 || has_jobs)
 			schedq_push(q->schedq, q);
 		return;
 	}
@@ -451,7 +452,7 @@ sched_update_deq_sc(sched_elem_t *q,
 	q->qschst = nss;
 
 	if (ticket != TICKET_INVALID) {
-		if (oss.numevts > 0 && nss.numevts <= 0) {
+		if (oss.numevts > 0 && nss.numevts <= 0 && !has_jobs) {
 			/* NE->E transition, need to pop */
 			if (!schedq_elem_on_queue(q) ||
 			    !schedq_cond_pop(q->schedq, q)) {
@@ -910,7 +911,7 @@ dequeue_atomic:
 		 */
 		if (ts->dequeued < atomq->qschst.wrr_budget) {
 			num = _odp_queue_deq_sc(atomq, ev, num_evts);
-			if (odp_likely(num != 0)) {
+			if (odp_likely(num > 0)) {
 #ifdef CONFIG_QSCHST_LOCK
 				UNLOCK(&atomq->qschlock);
 #endif
@@ -924,6 +925,8 @@ dequeue_atomic:
 					*from = queue_get_handle((queue_entry_t *)atomq);
 				return num;
 			}
+			if (num == -2)
+				atomq->sched_wait = SCHED_WAIT;
 		}
 		/* Atomic queue was empty or interrupted by WRR, release it. */
 		_schedule_release_atomic(ts);
@@ -950,6 +953,15 @@ restart_same:
 		elem = schedq_peek(schedq);
 		if (odp_unlikely(elem == NULL)) {
 			/* Schedq empty, look at next one. */
+			continue;
+		}
+		if (odp_unlikely(elem->sched_wait > 0)) {
+			/* Recently scheduled queue with poll jobs, look at next one. */
+			--elem->sched_wait;
+			continue;
+		}
+		if (odp_unlikely(((queue_entry_t *)elem)->status == QUEUE_STATUS_FREE)) {
+			/* Recently destroyed queue, look at next one. */
 			continue;
 		}
 		if (is_pktin(elem)) {
@@ -1010,30 +1022,35 @@ restart_same:
 			LOCK(&elem->qschlock);
 			num = _odp_queue_deq_sc(elem, ev, num_evts);
 			if (odp_likely(num != 0)) {
-				sched_update_deq_sc(elem, num, false);
-				UNLOCK(&elem->qschlock);
-				if (from)
-					*from =
-					queue_get_handle((queue_entry_t *)elem);
-				return num;
+				sched_update_deq_sc(elem, num < 0 ? 0 : num, false);
+				if (odp_likely(num > 0)) {
+					UNLOCK(&elem->qschlock);
+					if (from)
+						*from = queue_get_handle((queue_entry_t *)elem);
+					return num;
+				}
 			}
+			if (num == -2)
+				elem->sched_wait = SCHED_WAIT;
 			UNLOCK(&elem->qschlock);
 #else
 			num = _odp_queue_deq_mc(elem, ev, num_evts);
 			if (odp_likely(num != 0)) {
-				sched_update_deq(elem, num, false);
-				if (from)
-					*from =
-					queue_get_handle((queue_entry_t *)elem);
-				return num;
+				sched_update_deq(elem, num < 0 ? 0 : num, false);
+				if (odp_likely(num > 0)) {
+					if (from)
+						*from = queue_get_handle((queue_entry_t *)elem);
+					return num;
+				}
 			}
+			if (num == -2)
+				elem->sched_wait = SCHED_WAIT;
 #endif
 		} else if (elem->cons_type == ODP_SCHED_SYNC_ORDERED) {
 			reorder_window_t *rwin;
 			reorder_context_t *rctx;
 			uint32_t sn;
 			uint32_t idx;
-
 			/* The ordered queue has a reorder window so requires
 			 * order restoration. We must use a reorder context to
 			 * collect all outgoing events. Ensure there is at least
@@ -1084,23 +1101,26 @@ restart_same:
 
 			/* Was dequeue successful? */
 			if (odp_likely(num != 0)) {
-				/* Perform scheduler related updates */
 #ifdef CONFIG_QSCHST_LOCK
-				sched_update_deq_sc(elem, num,
-						    /*atomic=*/false);
-				UNLOCK(&elem->qschlock);
+				sched_update_deq_sc(elem, num < 0 ? 0 : num, /*atomic=*/false);
 #else
-				sched_update_deq(elem, num, /*atomic=*/false);
+				sched_update_deq(elem, num < 0 ? 0 : num, /*atomic=*/false);
 #endif
+				if (odp_likely(num > 0)) {
+#ifdef CONFIG_QSCHST_LOCK
+					UNLOCK(&elem->qschlock);
+#endif
+					/* Are we in-order or out-of-order? */
+					ts->out_of_order = sn != rwin->hc.head;
 
-				/* Are we in-order or out-of-order? */
-				ts->out_of_order = sn != rwin->hc.head;
-
-				ts->rctx = rctx;
-				if (from)
-					*from = queue_get_handle((queue_entry_t *)elem);
-				return num;
+					ts->rctx = rctx;
+					if (from)
+						*from = queue_get_handle((queue_entry_t *)elem);
+					return num;
+				}
 			}
+			if (num == -2)
+				elem->sched_wait = SCHED_WAIT;
 #ifdef CONFIG_QSCHST_LOCK
 			UNLOCK(&elem->qschlock);
 #endif
@@ -2066,25 +2086,33 @@ static int thr_rem(odp_schedule_group_t group, int thr)
 	return 0;
 }
 
-static int create_queue(uint32_t queue_index,
+static int create_queue(odp_queue_t queue,
 			const odp_schedule_param_t *sched_param)
 {
 	/* Not used in scalable scheduler. */
-	(void)queue_index;
+	(void)queue;
 	(void)sched_param;
 	return 0;
 }
 
-static void destroy_queue(uint32_t queue_index)
+static void destroy_queue(odp_queue_t queue)
 {
 	/* Not used in scalable scheduler. */
-	(void)queue_index;
+	(void)queue;
 }
 
-static int sched_queue(uint32_t queue_index)
+static int sched_queue(odp_queue_t queue)
 {
-	/* Not used in scalable scheduler. */
-	(void)queue_index;
+	queue_entry_t *qentry = _odp_qentry_from_ext(queue);
+	sched_elem_t *elem = &qentry->sched_elem;
+
+	_ODP_ASSERT(elem->schedq != NULL);
+
+	if (odp_unlikely(schedq_elem_on_queue(elem) || elem->pop_deficit > 0))
+		return -1;
+
+	schedq_push(elem->schedq, elem);
+
 	return 0;
 }
 

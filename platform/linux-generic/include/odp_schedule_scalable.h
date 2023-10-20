@@ -58,6 +58,7 @@ typedef uint32_t ringidx_t;
 #endif
 
 #define ODP_NO_SCHED_QUEUE (ODP_SCHED_SYNC_ORDERED + 1)
+#define FLAG_PKTIN 0x80
 
 typedef struct ODP_ALIGNED_CACHE {
 	struct llnode node;
@@ -66,6 +67,7 @@ typedef struct ODP_ALIGNED_CACHE {
 	odp_ticketlock_t qschlock;
 #endif
 	qschedstate_t qschst;
+	uint8_t sched_wait;
 	uint8_t pop_deficit;
 	uint8_t qschst_type;
 	uint8_t pktio_idx;
