@@ -43,6 +43,7 @@
 #define NUM_GROUP         (NUM_STATIC_GROUP + 9)
 #define NUM_PKTIN         32
 #define NUM_PRIO          3
+#define SCHED_WAIT        2
 #define MAX_API_PRIO      (NUM_PRIO - 2)
 /* Lowest internal priority */
 #define PKTIN_PRIO        (NUM_PRIO - 1)
@@ -72,6 +73,7 @@ typedef struct ODP_ALIGNED_CACHE {
 	int                group;
 	int                init;
 	int                num_pktin;
+	int                sched_wait;
 	int                pktin_idx[NUM_PKTIN];
 	odp_queue_t        queue[NUM_PKTIN];
 } sched_cmd_t;
@@ -192,6 +194,7 @@ static int init_global(void)
 		sched_global->queue_cmd[i].type     = CMD_QUEUE;
 		sched_global->queue_cmd[i].index    = i;
 		sched_global->queue_cmd[i].ring_idx = index_to_ring_idx(0, i);
+		sched_global->queue_cmd[i].sched_wait = 0;
 	}
 
 	for (i = 0; i < NUM_PKTIO; i++) {
@@ -434,11 +437,12 @@ static int num_grps(void)
 	return NUM_GROUP - NUM_STATIC_GROUP;
 }
 
-static int create_queue(uint32_t qi, const odp_schedule_param_t *sched_param)
+static int create_queue(odp_queue_t queue, const odp_schedule_param_t *sched_param)
 {
 	sched_group_t *sched_group = &sched_global->sched_group;
 	odp_schedule_group_t group = sched_param->group;
 	int prio = 0;
+	uint32_t qi = queue_to_index(queue);
 
 	if (odp_global_rw->schedule_configured == 0) {
 		_ODP_ERR("Scheduler has not been configured\n");
@@ -461,8 +465,10 @@ static int create_queue(uint32_t qi, const odp_schedule_param_t *sched_param)
 	return 0;
 }
 
-static void destroy_queue(uint32_t qi)
+static void destroy_queue(odp_queue_t queue)
 {
+	uint32_t qi = queue_to_index(queue);
+
 	sched_global->queue_cmd[qi].prio  = 0;
 	sched_global->queue_cmd[qi].group = 0;
 	sched_global->queue_cmd[qi].init  = 0;
@@ -484,6 +490,7 @@ static inline sched_cmd_t *rem_head(int group, int prio)
 	prio_queue_t *prio_queue;
 	uint32_t ring_idx, index;
 	int pktio;
+	sched_cmd_t *cmd;
 
 	prio_queue = &sched_global->prio_queue[group][prio];
 
@@ -495,11 +502,20 @@ static inline sched_cmd_t *rem_head(int group, int prio)
 	if (pktio)
 		return &sched_global->pktio_cmd[index];
 
-	return &sched_global->queue_cmd[index];
+	cmd = &sched_global->queue_cmd[ring_idx];
+
+	if (cmd->sched_wait > 0) {
+		--cmd->sched_wait;
+		add_tail(cmd);
+		return NULL;
+	}
+
+	return cmd;
 }
 
-static int sched_queue(uint32_t qi)
+static int sched_queue(odp_queue_t queue)
 {
+	uint32_t qi = queue_to_index(queue);
 	sched_cmd_t *cmd;
 
 	cmd = &sched_global->queue_cmd[qi];
@@ -697,6 +713,12 @@ static int schedule_multi(odp_queue_t *from, uint64_t wait,
 		num = _odp_sched_queue_deq(qi, events, 1, 1);
 
 		if (num <= 0) {
+			if (num == -2) {
+				/* Keep scheduled if requested */
+				cmd->sched_wait = SCHED_WAIT;
+				add_tail(cmd);
+			}
+
 			timer_run(1);
 			/* Destroyed or empty queue. Remove empty queue from
 			 * scheduling. A dequeue operation to on an already

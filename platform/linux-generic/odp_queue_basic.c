@@ -358,7 +358,7 @@ static odp_queue_t queue_create(const char *name,
 		return ODP_QUEUE_INVALID;
 
 	if (type == ODP_QUEUE_TYPE_SCHED) {
-		if (_odp_sched_fn->create_queue(queue->index,
+		if (_odp_sched_fn->create_queue(queue->handle,
 						&queue->param.sched)) {
 			queue->status = QUEUE_STATUS_FREE;
 			_ODP_ERR("schedule queue init failed\n");
@@ -392,15 +392,19 @@ static int queue_create_multi(const char *name[], const odp_queue_param_t param[
 	return i;
 }
 
-void _odp_sched_queue_set_status(uint32_t queue_index, int status)
+int _odp_sched_queue_set_status(uint32_t queue_index, int status)
 {
 	queue_entry_t *queue = qentry_from_index(queue_index);
+	int is_diff = 0;
 
 	LOCK(queue);
 
+	is_diff = queue->status != status;
 	queue->status = status;
 
 	UNLOCK(queue);
+
+	return is_diff;
 }
 
 static int queue_destroy(odp_queue_t handle)
@@ -444,7 +448,7 @@ static int queue_destroy(odp_queue_t handle)
 		break;
 	case QUEUE_STATUS_NOTSCHED:
 		queue->status = QUEUE_STATUS_FREE;
-		_odp_sched_fn->destroy_queue(queue->index);
+		_odp_sched_fn->destroy_queue(handle);
 		break;
 	case QUEUE_STATUS_SCHED:
 		/* Queue is still in scheduling */
@@ -953,7 +957,7 @@ static inline int _sched_queue_enq_multi(odp_queue_t handle,
 	UNLOCK(queue);
 
 	/* Add queue to scheduling */
-	if (sched && _odp_sched_fn->sched_queue(queue->index))
+	if (sched && _odp_sched_fn->sched_queue(handle))
 		_ODP_ABORT("schedule_queue failed\n");
 
 	return num_enq;
@@ -962,45 +966,69 @@ static inline int _sched_queue_enq_multi(odp_queue_t handle,
 int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num,
 			 int update_status)
 {
-	int num_deq, status;
+	int num_deq, status, num_enq;
 	ring_st_t *ring_st;
 	queue_entry_t *queue = qentry_from_index(queue_index);
 	uint32_t event_idx[max_num];
 
 	ring_st = &queue->ring_st;
-
 	LOCK(queue);
-
 	status = queue->status;
 
 	if (odp_unlikely(status < QUEUE_STATUS_READY)) {
-		/* Bad queue, or queue has been destroyed.
-		 * Inform scheduler about a destroyed queue. */
-		if (queue->status == QUEUE_STATUS_DESTROYED) {
+		/* Bad or destroyed queue, inform scheduler about a destroyed queue. */
+		if (status == QUEUE_STATUS_DESTROYED) {
 			queue->status = QUEUE_STATUS_FREE;
-			_odp_sched_fn->destroy_queue(queue_index);
+			_odp_sched_fn->destroy_queue(queue->handle);
 		}
 
 		UNLOCK(queue);
 		return -1;
 	}
 
-	num_deq = ring_st_deq_multi(ring_st, queue->ring_data,
-				    queue->ring_mask, event_idx, max_num);
+	num_deq = ring_st_deq_multi(ring_st, queue->ring_data, queue->ring_mask, event_idx,
+				    max_num);
 
-	if (num_deq == 0) {
-		/* Already empty queue */
+	if (num_deq > 0) {
+		UNLOCK(queue);
+		event_index_to_hdr((_odp_event_hdr_t **)ev, event_idx, num_deq);
+		return num_deq;
+	}
+
+	if (!_odp_qpj_has_jobs(&queue->wss)) {
+		/* Empty queue and no jobs to process */
 		if (update_status && status == QUEUE_STATUS_SCHED)
 			queue->status = QUEUE_STATUS_NOTSCHED;
 
 		UNLOCK(queue);
-
 		return 0;
 	}
 
 	UNLOCK(queue);
+	num_deq = _odp_qpj_poll(&queue->wss, queue->handle, (_odp_event_hdr_t **)ev, max_num);
 
-	event_index_to_hdr((_odp_event_hdr_t **)ev, event_idx, num_deq);
+	if (_odp_qpj_is_err(num_deq)) {
+		LOCK(queue);
+
+		if (num_deq == _ODP_QPJ_DONE && queue->status == QUEUE_STATUS_SCHED)
+			queue->status = QUEUE_STATUS_NOTSCHED;
+
+		UNLOCK(queue);
+		return num_deq == _ODP_QPJ_KEEP ? -2 : -1;
+	}
+
+	if (queue->param.sched.sync == ODP_SCHED_SYNC_ORDERED) {
+		num_enq = odp_queue_enq_multi(queue->handle, ev, num_deq);
+
+		if (odp_unlikely(num_enq < num_deq)) {
+			num_enq = num_enq < 0 ? 0 : num_enq;
+			_odp_event_free_multi((_odp_event_hdr_t **)&ev[num_enq],
+					      num_deq - num_enq);
+			_ODP_DBG("Dropped %d events\n", num_deq - num_enq);
+		}
+
+		return -2;
+	}
 
 	return num_deq;
 }
@@ -1036,7 +1064,7 @@ int _odp_sched_queue_empty(uint32_t queue_index)
 		return -1;
 	}
 
-	if (ring_st_is_empty(&queue->ring_st)) {
+	if (ring_st_is_empty(&queue->ring_st) && !_odp_qpj_has_jobs(&queue->wss)) {
 		/* Already empty queue. Update status. */
 		if (queue->status == QUEUE_STATUS_SCHED)
 			queue->status = QUEUE_STATUS_NOTSCHED;
@@ -1236,6 +1264,13 @@ static void queue_add_poll_job(odp_queue_t handle, _odp_qpj_ws_data_t *data)
 	queue_entry_t *queue = qentry_from_handle(handle);
 
 	_odp_qpj_add(&queue->wss, data);
+
+	if (queue->type == ODP_QUEUE_TYPE_SCHED) {
+		if (!_odp_sched_queue_set_status(queue->index, QUEUE_STATUS_SCHED))
+			return;
+
+		(void)_odp_sched_fn->sched_queue(handle);
+	}
 }
 
 static int queue_api_enq(odp_queue_t handle, odp_event_t ev)
