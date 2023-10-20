@@ -44,13 +44,14 @@ struct ODP_ALIGNED_CACHE queue_entry_s {
 	queue_deq_multi_fn_t dequeue_multi;
 	queue_deq_multi_fn_t orig_dequeue_multi;
 
-	uint32_t           index;
-	odp_queue_t        handle;
-	odp_queue_type_t   type;
-	odp_queue_param_t  param;
-	odp_pktin_queue_t  pktin;
-	odp_pktout_queue_t pktout;
-	char               name[ODP_QUEUE_NAME_LEN];
+	_odp_qpj_poll_jobs_t jobs;
+	uint32_t             index;
+	odp_queue_t          handle;
+	odp_queue_type_t     type;
+	odp_queue_param_t    param;
+	odp_pktin_queue_t    pktin;
+	odp_pktout_queue_t   pktout;
+	char                 name[ODP_QUEUE_NAME_LEN];
 };
 
 int _odp_queue_deq(sched_elem_t *q, _odp_event_hdr_t *event_hdr[], int num);

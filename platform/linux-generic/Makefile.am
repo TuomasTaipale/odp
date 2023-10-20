@@ -166,6 +166,7 @@ noinst_HEADERS = \
 		  include/odp_queue_if.h \
 		  include/odp_queue_basic_internal.h \
 		  include/odp_queue_lf.h \
+		  include/odp_queue_poll_job.h \
 		  include/odp_queue_scalable_internal.h \
 		  include/odp_random_std_internal.h \
 		  include/odp_random_openssl_internal.h \

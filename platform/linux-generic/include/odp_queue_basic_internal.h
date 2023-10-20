@@ -57,15 +57,17 @@ typedef struct ODP_ALIGNED_CACHE queue_entry_s {
 	};
 
 	odp_atomic_u64_t     num_timers;
+
+	_odp_qpj_poll_jobs_t jobs;
 	int                  status;
 
 	queue_deq_multi_fn_t orig_dequeue_multi;
-	odp_queue_param_t param;
-	odp_pktin_queue_t pktin;
-	odp_pktout_queue_t pktout;
-	void             *queue_lf;
-	int               spsc;
-	char              name[ODP_QUEUE_NAME_LEN];
+	odp_queue_param_t    param;
+	odp_pktin_queue_t    pktin;
+	odp_pktout_queue_t   pktout;
+	void                 *queue_lf;
+	int                  spsc;
+	char                 name[ODP_QUEUE_NAME_LEN];
 } queue_entry_t;
 
 typedef struct queue_global_t {
