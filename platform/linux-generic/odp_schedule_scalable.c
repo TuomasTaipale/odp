@@ -17,8 +17,10 @@
 #include <odp/api/thrmask.h>
 #include <odp/api/time.h>
 
+#include <odp/api/plat/cpu_inlines.h>
 #include <odp/api/plat/schedule_inline_types.h>
 #include <odp/api/plat/thread_inlines.h>
+#include <odp/api/plat/ticketlock_inlines.h>
 #include <odp/api/plat/time_inlines.h>
 
 #include <odp_config_internal.h>
@@ -26,21 +28,18 @@
 #include <odp_shm_internal.h>
 #include <odp_ishmpool_internal.h>
 
-#include <odp/api/plat/cpu_inlines.h>
 #include <odp_llqueue.h>
 #include <odp_queue_scalable_internal.h>
 #include <odp_schedule_if.h>
 #include <odp_bitset.h>
 #include <odp_event_internal.h>
 #include <odp_macros_internal.h>
-#include <odp_packet_io_internal.h>
 #include <odp_timer_internal.h>
 
 #include <limits.h>
 #include <stdbool.h>
 #include <string.h>
 
-#include <odp/api/plat/ticketlock_inlines.h>
 #define LOCK(a) odp_ticketlock_lock((a))
 #define UNLOCK(a) odp_ticketlock_unlock((a))
 
@@ -94,7 +93,6 @@ static int thread_state_init(int tidx)
 	ts->rvec_free = (1ULL << TS_RVEC_SIZE) - 1;
 	ts->num_schedq = 0;
 	ts->sg_sem = 1; /* Start with sched group semaphore changed */
-	ts->loop_cnt = 0;
 	memset(ts->sg_actual, 0, sizeof(ts->sg_actual));
 	for (i = 0; i < TS_RVEC_SIZE; i++) {
 		ts->rvec[i].rvec_free = &ts->rvec_free;
@@ -552,22 +550,6 @@ sched_queue_t *_odp_sched_queue_add(odp_schedule_group_t grp, uint32_t prio)
 	return &sg->schedq[prio * sg->xfactor + x % sg->xfactor];
 }
 
-static uint32_t sched_pktin_add(odp_schedule_group_t grp, uint32_t prio)
-{
-	uint32_t sgi;
-	sched_group_t *sg;
-
-	_ODP_ASSERT(grp >= 0 && grp < (odp_schedule_group_t)MAX_SCHED_GROUP);
-	_ODP_ASSERT((global->sg_free & (1ULL << grp)) == 0);
-	_ODP_ASSERT(prio < ODP_SCHED_PRIO_NUM);
-
-	sgi = grp;
-	sg = global->sg_vec[sgi];
-
-	(void)_odp_sched_queue_add(grp, ODP_SCHED_PRIO_PKTIN);
-	return (ODP_SCHED_PRIO_PKTIN - prio) * sg->xfactor;
-}
-
 static void signal_threads_rem(sched_group_t *sg, uint32_t sgi, uint32_t prio)
 {
 	sched_group_mask_t thrds = sg->thr_wanted;
@@ -607,11 +589,6 @@ void _odp_sched_queue_rem(odp_schedule_group_t grp, uint32_t prio)
 		 */
 		signal_threads_rem(sg, sgi, prio);
 	}
-}
-
-static void sched_pktin_rem(odp_schedule_group_t grp)
-{
-	_odp_sched_queue_rem(grp, ODP_SCHED_PRIO_PKTIN);
 }
 
 static void update_sg_add(sched_scalable_thread_state_t *ts,
@@ -705,43 +682,6 @@ static inline void _schedule_release_ordered(sched_scalable_thread_state_t *ts)
 	ts->rctx = NULL;
 }
 
-static void pktio_start(int pktio_idx,
-			int num_in_queue,
-			int in_queue_idx[],
-			odp_queue_t odpq[])
-{
-	int i, rxq;
-	queue_entry_t *qentry;
-	sched_elem_t *elem;
-
-	_ODP_ASSERT(pktio_idx < CONFIG_PKTIO_ENTRIES);
-	for (i = 0; i < num_in_queue; i++) {
-		rxq = in_queue_idx[i];
-		_ODP_ASSERT(rxq < ODP_PKTIN_MAX_QUEUES);
-		__atomic_fetch_add(&global->poll_count[pktio_idx], 1,
-				   __ATOMIC_RELAXED);
-		qentry = _odp_qentry_from_ext(odpq[i]);
-		elem = &qentry->sched_elem;
-		elem->cons_type |= FLAG_PKTIN; /* Set pktin queue flag */
-		elem->pktio_idx = pktio_idx;
-		elem->rx_queue = rxq;
-		elem->xoffset = sched_pktin_add(elem->sched_grp, elem->sched_prio);
-		_ODP_ASSERT(elem->schedq != NULL);
-		schedq_push(elem->schedq, elem);
-	}
-}
-
-static void pktio_stop(sched_elem_t *elem)
-{
-	sched_pktin_rem(elem->sched_grp);
-	if (__atomic_sub_fetch(&global->poll_count[elem->pktio_idx],
-			       1, __ATOMIC_RELAXED) == 0) {
-		/* Call stop_finalize when all queues
-		 * of the pktio have been removed */
-		_odp_sched_cb_pktio_stop_finalize(elem->pktio_idx);
-	}
-}
-
 static bool have_reorder_ctx(sched_scalable_thread_state_t *ts)
 {
 	if (odp_unlikely(bitset_is_null(ts->priv_rvec_free))) {
@@ -755,124 +695,11 @@ static bool have_reorder_ctx(sched_scalable_thread_state_t *ts)
 	return true;
 }
 
-static inline bool is_pktin(sched_elem_t *elem)
-{
-	return (elem->cons_type & FLAG_PKTIN) != 0;
-}
-
-static inline bool is_atomic(sched_elem_t *elem)
-{
-	return elem->cons_type == (ODP_SCHED_SYNC_ATOMIC | FLAG_PKTIN);
-}
-
-static inline bool is_ordered(sched_elem_t *elem)
-{
-	return elem->cons_type == (ODP_SCHED_SYNC_ORDERED | FLAG_PKTIN);
-}
-
-static int poll_pktin(sched_elem_t *elem, odp_event_t ev[], int num_evts)
-{
-	sched_scalable_thread_state_t *ts = _odp_sched_ts;
-	int num, i;
-	/* For ordered queues only */
-	reorder_context_t *rctx;
-	reorder_window_t *rwin = NULL;
-	uint32_t sn = 0;
-	uint32_t idx;
-
-	if (is_ordered(elem)) {
-		/* Need reorder context and slot in reorder window */
-		rwin = queue_get_rwin((queue_entry_t *)elem);
-		_ODP_ASSERT(rwin != NULL);
-		if (odp_unlikely(!have_reorder_ctx(ts) ||
-				 !_odp_rwin_reserve_sc(rwin, &sn))) {
-			/* Put back queue on source schedq */
-			schedq_push(ts->src_schedq, elem);
-			return 0;
-		}
-		/* Slot in reorder window reserved! */
-	}
-
-	/* Try to dequeue events from the ingress queue itself */
-	num = _odp_queue_deq_sc(elem, ev, num_evts);
-	if (odp_likely(num > 0)) {
-events_dequeued:
-		if (is_atomic(elem)) {
-			ts->atomq = elem; /* Remember */
-			ts->dequeued += num;
-			/* Don't push atomic queue on schedq */
-		} else /* Parallel or ordered */ {
-			if (is_ordered(elem)) {
-				/* Find and initialise an unused reorder
-				 * context. */
-				idx = bitset_ffs(ts->priv_rvec_free) - 1;
-				ts->priv_rvec_free =
-					bitset_clr(ts->priv_rvec_free, idx);
-				rctx = &ts->rvec[idx];
-				_odp_rctx_init(rctx, idx, rwin, sn);
-				/* Are we in-order or out-of-order? */
-				ts->out_of_order = sn != rwin->hc.head;
-				ts->rctx = rctx;
-			}
-			schedq_push(elem->schedq, elem);
-		}
-		return num;
-	}
-
-	/* Ingress queue empty => poll pktio RX queue */
-	_odp_event_hdr_t *rx_evts[QUEUE_MULTI_MAX];
-	int num_rx = _odp_sched_cb_pktin_poll(elem->pktio_idx, elem->rx_queue,
-					      rx_evts, QUEUE_MULTI_MAX);
-
-	if (odp_likely(num_rx > 0)) {
-		num = num_rx < num_evts ? num_rx : num_evts;
-		for (i = 0; i < num; i++) {
-			/* Return events directly to caller */
-			ev[i] = _odp_event_from_hdr(rx_evts[i]);
-		}
-		if (num_rx > num) {
-			/* Events remain, enqueue them */
-			i = _odp_queue_enq_sp(elem, &rx_evts[num], num_rx - num);
-			/* Enqueue must succeed as the queue was empty */
-			_ODP_ASSERT(i == num_rx - num);
-		}
-		goto events_dequeued;
-	}
-	/* No packets received, reset state and undo side effects */
-	if (is_atomic(elem))
-		ts->atomq = NULL;
-	else if (is_ordered(elem))
-		_odp_rwin_unreserve_sc(rwin, sn);
-
-	if (odp_likely(num_rx == 0)) {
-		/* RX queue empty, push it to pktin priority schedq */
-		sched_queue_t *schedq = ts->src_schedq;
-		/* Check if queue came from the designated schedq */
-		if (schedq == elem->schedq) {
-			/* Yes, add offset to the pktin priority level
-			 * in order to get alternate schedq */
-			schedq += elem->xoffset;
-		}
-		/* Else no, queue must have come from alternate schedq */
-		schedq_push(schedq, elem);
-	} else /* num_rx < 0 => pktio stopped or closed */ {
-		/* Remove queue */
-		pktio_stop(elem);
-		/* Don't push queue to schedq */
-	}
-
-	_ODP_ASSERT(ts->atomq == NULL);
-	_ODP_ASSERT(!ts->out_of_order);
-	_ODP_ASSERT(ts->rctx == NULL);
-	return 0;
-}
-
 static int _schedule(odp_queue_t *from, odp_event_t ev[], int num_evts)
 {
 	sched_scalable_thread_state_t *ts;
 	sched_elem_t *atomq;
 	int num;
-	int cpu_id;
 	uint32_t i;
 
 	ts = _odp_sched_ts;
@@ -883,22 +710,7 @@ static int _schedule(odp_queue_t *from, odp_event_t ev[], int num_evts)
 	/* Once an atomic queue has been scheduled to a thread, it will stay
 	 * on that thread until empty or 'rotated' by WRR
 	 */
-	if (atomq != NULL && is_pktin(atomq)) {
-		/* Atomic pktin queue */
-		if (ts->dequeued < atomq->qschst.wrr_budget) {
-			_ODP_ASSERT(ts->src_schedq != NULL);
-			num = poll_pktin(atomq, ev, num_evts);
-			if (odp_likely(num != 0)) {
-				if (from)
-					*from = queue_get_handle((queue_entry_t *)atomq);
-				return num;
-			}
-		} else {
-			/* WRR budget exhausted, move queue to end of schedq */
-			schedq_push(atomq->schedq, atomq);
-		}
-		ts->atomq = NULL;
-	} else if (atomq != NULL) {
+	if (atomq != NULL) {
 		_ODP_ASSERT(ts->ticket != TICKET_INVALID);
 #ifdef CONFIG_QSCHST_LOCK
 		LOCK(&atomq->qschlock);
@@ -942,13 +754,11 @@ dequeue_atomic:
 		update_sg_membership(ts);
 	}
 
-	cpu_id = odp_cpu_id();
 	/* Scan our schedq list from beginning to end */
 	for (i = 0; i < ts->num_schedq; i++) {
 		sched_queue_t *schedq = ts->schedq_list[i];
 		sched_elem_t *elem;
 
-		ts->loop_cnt++;
 restart_same:
 		elem = schedq_peek(schedq);
 		if (odp_unlikely(elem == NULL)) {
@@ -964,26 +774,7 @@ restart_same:
 			/* Recently destroyed queue, look at next one. */
 			continue;
 		}
-		if (is_pktin(elem)) {
-			/* Pktio ingress queue */
-			if (elem->schedq != schedq) { /* Low priority schedq*/
-				if (elem->loop_check[cpu_id] != ts->loop_cnt)
-					elem->loop_check[cpu_id] = ts->loop_cnt;
-				else /* Wrapped around */
-					continue; /* Go to next schedq */
-			}
-
-			if (odp_unlikely(!schedq_cond_pop(schedq, elem)))
-				goto restart_same;
-
-			ts->src_schedq = schedq; /* Remember source schedq */
-			num = poll_pktin(elem, ev, num_evts);
-			if (odp_unlikely(num <= 0))
-				goto restart_same;
-			if (from)
-				*from = queue_get_handle((queue_entry_t *)elem);
-			return num;
-		} else if (elem->cons_type == ODP_SCHED_SYNC_ATOMIC) {
+		if (elem->cons_type == ODP_SCHED_SYNC_ATOMIC) {
 			/* Dequeue element only if it is still at head
 			 * of schedq.
 			 */
@@ -1385,7 +1176,7 @@ static uint64_t schedule_wait_time(uint64_t ns)
 
 static int schedule_num_prio(void)
 {
-	return ODP_SCHED_PRIO_NUM - 1; /* Discount the pktin priority level */
+	return ODP_SCHED_PRIO_NUM;
 }
 
 static int schedule_min_prio(void)
@@ -2219,7 +2010,6 @@ static const _odp_schedule_api_fn_t *sched_api(void)
 }
 
 const schedule_fn_t _odp_schedule_scalable_fn = {
-	.pktio_start	= pktio_start,
 	.thr_add	= thr_add,
 	.thr_rem	= thr_rem,
 	.num_grps	= num_grps,

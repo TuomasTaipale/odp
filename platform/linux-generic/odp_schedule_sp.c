@@ -42,18 +42,12 @@
 #define NUM_ORDERED_LOCKS 1
 #define NUM_STATIC_GROUP  3
 #define NUM_GROUP         (NUM_STATIC_GROUP + 9)
-#define NUM_PKTIN         32
 #define NUM_PRIO          3
 #define SCHED_WAIT        2
-#define MAX_API_PRIO      (NUM_PRIO - 2)
-/* Lowest internal priority */
-#define PKTIN_PRIO        (NUM_PRIO - 1)
-#define CMD_QUEUE         0
-#define CMD_PKTIO         1
+#define MAX_API_PRIO      (NUM_PRIO - 1)
 #define GROUP_ALL         ODP_SCHED_GROUP_ALL
 #define GROUP_WORKER      ODP_SCHED_GROUP_WORKER
 #define GROUP_CONTROL     ODP_SCHED_GROUP_CONTROL
-#define GROUP_PKTIN       GROUP_ALL
 
 /* Maximum number of commands: one priority/group for all queues and pktios */
 #define RING_SIZE         (_ODP_ROUNDUP_POWER2_U32(NUM_QUEUE + NUM_PKTIO))
@@ -69,14 +63,10 @@ ODP_STATIC_ASSERT(NUM_ORDERED_LOCKS <= CONFIG_QUEUE_MAX_ORD_LOCKS,
 typedef struct ODP_ALIGNED_CACHE {
 	uint32_t           index;
 	uint32_t           ring_idx;
-	int                type;
 	int                prio;
 	int                group;
 	int                init;
-	int                num_pktin;
 	int                sched_wait;
-	int                pktin_idx[NUM_PKTIN];
-	odp_queue_t        queue[NUM_PKTIN];
 } sched_cmd_t;
 
 #pragma GCC diagnostic push
@@ -123,7 +113,6 @@ typedef struct ODP_ALIGNED_CACHE sched_group_t {
 
 typedef struct {
 	sched_cmd_t   queue_cmd[NUM_QUEUE];
-	sched_cmd_t   pktio_cmd[NUM_PKTIO];
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -149,26 +138,6 @@ static __thread sched_local_t sched_local;
 
 static void remove_group(sched_group_t *sched_group, int thr, int group);
 
-static inline uint32_t index_to_ring_idx(int pktio, uint32_t index)
-{
-	if (pktio)
-		return (0x80000000 | index);
-
-	return index;
-}
-
-static inline uint32_t index_from_ring_idx(uint32_t *index, uint32_t ring_idx)
-{
-	uint32_t pktio = ring_idx & 0x80000000;
-
-	if (pktio)
-		*index = ring_idx & (~0x80000000);
-	else
-		*index = ring_idx;
-
-	return pktio;
-}
-
 static int init_global(void)
 {
 	int i, j;
@@ -192,18 +161,9 @@ static int init_global(void)
 	sched_global->shm = shm;
 
 	for (i = 0; i < NUM_QUEUE; i++) {
-		sched_global->queue_cmd[i].type     = CMD_QUEUE;
-		sched_global->queue_cmd[i].index    = i;
-		sched_global->queue_cmd[i].ring_idx = index_to_ring_idx(0, i);
+		sched_global->queue_cmd[i].index      = i;
+		sched_global->queue_cmd[i].ring_idx   = i;
 		sched_global->queue_cmd[i].sched_wait = 0;
-	}
-
-	for (i = 0; i < NUM_PKTIO; i++) {
-		sched_global->pktio_cmd[i].type     = CMD_PKTIO;
-		sched_global->pktio_cmd[i].index    = i;
-		sched_global->pktio_cmd[i].ring_idx = index_to_ring_idx(1, i);
-		sched_global->pktio_cmd[i].prio     = PKTIN_PRIO;
-		sched_global->pktio_cmd[i].group    = GROUP_PKTIN;
 	}
 
 	for (i = 0; i < NUM_GROUP; i++)
@@ -255,7 +215,7 @@ static int term_global(void)
 		int report = 1;
 
 		if (sched_global->queue_cmd[qi].init) {
-			while (_odp_sched_queue_deq(qi, &event, 1, 1) > 0) {
+			while (_odp_sched_queue_deq(qi, &event, 1) > 0) {
 				if (report) {
 					_ODP_ERR("Queue not empty\n");
 					report = 0;
@@ -489,19 +449,13 @@ static inline void add_tail(sched_cmd_t *cmd)
 static inline sched_cmd_t *rem_head(int group, int prio)
 {
 	prio_queue_t *prio_queue;
-	uint32_t ring_idx, index;
-	int pktio;
+	uint32_t ring_idx;
 	sched_cmd_t *cmd;
 
 	prio_queue = &sched_global->prio_queue[group][prio];
 
 	if (ring_u32_deq(&prio_queue->ring, RING_MASK, &ring_idx) == 0)
 		return NULL;
-
-	pktio = index_from_ring_idx(&index, ring_idx);
-
-	if (pktio)
-		return &sched_global->pktio_cmd[index];
 
 	cmd = &sched_global->queue_cmd[ring_idx];
 
@@ -535,31 +489,6 @@ static int ord_enq_multi(odp_queue_t queue, void *buf_hdr[], int num,
 
 	/* didn't consume the events */
 	return 0;
-}
-
-static void pktio_start(int pktio_index,
-			int num,
-			int pktin_idx[],
-			odp_queue_t queue[])
-{
-	int i;
-	sched_cmd_t *cmd;
-
-	_ODP_DBG("pktio index: %i, %i pktin queues %i\n", pktio_index, num, pktin_idx[0]);
-
-	cmd = &sched_global->pktio_cmd[pktio_index];
-
-	if (num > NUM_PKTIN)
-		_ODP_ABORT("Supports only %i pktin queues per interface\n", NUM_PKTIN);
-
-	for (i = 0; i < num; i++) {
-		cmd->pktin_idx[i] = pktin_idx[i];
-		cmd->queue[i]     = queue[i];
-	}
-
-	cmd->num_pktin = num;
-
-	add_tail(cmd);
 }
 
 static inline sched_cmd_t *sched_cmd(void)
@@ -609,26 +538,6 @@ static uint64_t schedule_wait_time(uint64_t ns)
 	return ns;
 }
 
-static inline void enqueue_packets(odp_queue_t queue,
-				   _odp_event_hdr_t *hdr_tbl[], int num_pkt)
-{
-	int num_enq, num_drop;
-
-	num_enq = odp_queue_enq_multi(queue, (odp_event_t *)hdr_tbl,
-				      num_pkt);
-
-	if (num_enq < 0)
-		num_enq = 0;
-
-	if (num_enq < num_pkt) {
-		num_drop = num_pkt - num_enq;
-
-		_ODP_DBG("Dropped %i packets\n", num_drop);
-		odp_packet_free_multi((odp_packet_t *)&hdr_tbl[num_enq],
-				      num_drop);
-	}
-}
-
 static int schedule_multi(odp_queue_t *from, uint64_t wait,
 			  odp_event_t events[], int max_events ODP_UNUSED)
 {
@@ -653,42 +562,6 @@ static int schedule_multi(odp_queue_t *from, uint64_t wait,
 
 		cmd = sched_cmd();
 
-		if (cmd && cmd->type == CMD_PKTIO) {
-			_odp_event_hdr_t *hdr_tbl[CONFIG_BURST_SIZE];
-			int i;
-			int num_pkt = 0;
-			int max_num = CONFIG_BURST_SIZE;
-			int pktio_idx = cmd->index;
-			int num_pktin = cmd->num_pktin;
-			int *pktin_idx = cmd->pktin_idx;
-			odp_queue_t *queue = cmd->queue;
-
-			for (i = 0; i < num_pktin; i++) {
-				num_pkt = _odp_sched_cb_pktin_poll(pktio_idx,
-								   pktin_idx[i],
-								   hdr_tbl, max_num);
-
-				if (num_pkt < 0) {
-					/* Pktio stopped or closed. */
-					_odp_sched_cb_pktio_stop_finalize(pktio_idx);
-					break;
-				}
-
-				if (num_pkt == 0)
-					continue;
-
-				enqueue_packets(queue[i], hdr_tbl, num_pkt);
-			}
-
-			if (num_pkt >= 0) {
-				/* Continue polling pktio. */
-				add_tail(cmd);
-			}
-
-			/* run wait parameter checks under */
-			cmd = NULL;
-		}
-
 		if (cmd == NULL) {
 			timer_run(1);
 			/* All priority queues are empty */
@@ -712,7 +585,7 @@ static int schedule_multi(odp_queue_t *from, uint64_t wait,
 		}
 
 		qi  = cmd->index;
-		num = _odp_sched_queue_deq(qi, events, 1, 1);
+		num = _odp_sched_queue_deq(qi, events, 1);
 
 		if (num <= 0) {
 			if (num == _QPJ_KEEP) {
@@ -804,9 +677,7 @@ static int schedule_default_prio(void)
 
 static int schedule_num_prio(void)
 {
-	/* Lowest priority is used for pktin polling and is internal
-	 * to the scheduler */
-	return NUM_PRIO - 1;
+	return NUM_PRIO;
 }
 
 static odp_schedule_group_t schedule_group_create(const char *name,
@@ -1090,7 +961,6 @@ static const _odp_schedule_api_fn_t *sched_api(void)
 
 /* Fill in scheduler interface */
 const schedule_fn_t _odp_schedule_sp_fn = {
-	.pktio_start   = pktio_start,
 	.thr_add       = thr_add,
 	.thr_rem       = thr_rem,
 	.num_grps      = num_grps,

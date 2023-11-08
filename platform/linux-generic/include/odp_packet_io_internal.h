@@ -103,9 +103,6 @@ typedef struct ODP_ALIGNED_CACHE {
 	enum {
 		/* Not allocated */
 		PKTIO_STATE_FREE = 0,
-		/* Close pending on scheduler response. Next state after this
-		 * is PKTIO_STATE_FREE. */
-		PKTIO_STATE_CLOSE_PENDING,
 		/* Open in progress.
 		   Marker for all active states following under. */
 		PKTIO_STATE_ACTIVE,
@@ -113,8 +110,6 @@ typedef struct ODP_ALIGNED_CACHE {
 		PKTIO_STATE_OPENED,
 		/* Start completed */
 		PKTIO_STATE_STARTED,
-		/* Stop pending on scheduler response */
-		PKTIO_STATE_STOP_PENDING,
 		/* Stop completed */
 		PKTIO_STATE_STOPPED
 	} state;
@@ -153,9 +148,10 @@ typedef struct ODP_ALIGNED_CACHE {
 	uint32_t num_out_queue;
 
 	struct {
-		odp_queue_t        queue;
-		odp_pktin_queue_t  pktin;
+		odp_queue_t               queue;
+		odp_pktin_queue_t         pktin;
 		odp_pktin_vector_config_t vector;
+		_odp_qpj_poll_job_t       job;
 	} in_queue[ODP_PKTIN_MAX_QUEUES];
 
 	struct {

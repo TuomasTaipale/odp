@@ -755,14 +755,10 @@ int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 
 	if (odp_unlikely(actual <= 0)) {
 #ifdef CONFIG_QSCHST_LOCK
-		if ((q->cons_type & FLAG_PKTIN) == 0)
-			odp_ticketlock_unlock(&q->qschlock);
-
+		odp_ticketlock_unlock(&q->qschlock);
 		num_deq = _odp_qpj_poll(&entry->jobs, entry->handle, (_odp_event_hdr_t **)evp,
 					num);
-
-		if ((q->cons_type & FLAG_PKTIN) == 0)
-			odp_ticketlock_lock(&q->qschlock);
+		odp_ticketlock_lock(&q->qschlock);
 #else
 		num_deq = _odp_qpj_poll(&entry->jobs, entry->handle, (_odp_event_hdr_t **)evp,
 					num);
@@ -800,14 +796,10 @@ int _odp_queue_deq_sc(sched_elem_t *q, odp_event_t *evp, int num)
 #endif
 	if (actual < num) {
 #ifdef CONFIG_QSCHST_LOCK
-		if ((q->cons_type & FLAG_PKTIN) == 0)
-			odp_ticketlock_unlock(&q->qschlock);
-
+		odp_ticketlock_unlock(&q->qschlock);
 		num_deq = _odp_qpj_poll(&entry->jobs, entry->handle,
 					&((_odp_event_hdr_t **)evp)[actual], num - actual);
-
-		if ((q->cons_type & FLAG_PKTIN) == 0)
-			odp_ticketlock_lock(&q->qschlock);
+		odp_ticketlock_lock(&q->qschlock);
 #else
 		num_deq = _odp_qpj_poll(&entry->jobs, entry->handle,
 					&((_odp_event_hdr_t **)evp)[actual], num - actual);
@@ -1209,20 +1201,14 @@ static void queue_set_pktin(odp_queue_t handle, odp_pktio_t pktio, int index)
 static void queue_set_enq_deq_func(odp_queue_t handle,
 				   queue_enq_fn_t enq,
 				   queue_enq_multi_fn_t enq_multi,
-				   queue_deq_fn_t deq,
-				   queue_deq_multi_fn_t deq_multi)
+				   queue_deq_fn_t deq ODP_UNUSED,
+				   queue_deq_multi_fn_t deq_multi ODP_UNUSED)
 {
 	if (enq)
 		qentry_from_int(handle)->enqueue = enq;
 
 	if (enq_multi)
 		qentry_from_int(handle)->enqueue_multi = enq_multi;
-
-	if (deq)
-		qentry_from_int(handle)->dequeue = deq;
-
-	if (deq_multi)
-		qentry_from_int(handle)->dequeue_multi = deq_multi;
 }
 
 static int queue_orig_multi(odp_queue_t handle,
