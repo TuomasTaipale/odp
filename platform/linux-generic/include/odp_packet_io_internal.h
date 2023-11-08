@@ -153,9 +153,10 @@ typedef struct ODP_ALIGNED_CACHE {
 	uint32_t num_out_queue;
 
 	struct {
-		odp_queue_t        queue;
-		odp_pktin_queue_t  pktin;
+		odp_queue_t               queue;
+		odp_pktin_queue_t         pktin;
 		odp_pktin_vector_config_t vector;
+		poll_job_t                poll_job;
 	} in_queue[ODP_PKTIN_MAX_QUEUES];
 
 	struct {

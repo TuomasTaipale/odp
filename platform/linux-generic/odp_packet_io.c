@@ -684,6 +684,101 @@ int odp_pktio_config(odp_pktio_t hdl, const odp_pktio_config_t *config)
 	return res;
 }
 
+static inline odp_packet_vector_t packet_vector_create(odp_packet_t packets[], uint32_t num,
+						       odp_pool_t pool)
+{
+	odp_packet_vector_t pktv;
+	odp_packet_t *pkt_tbl;
+	uint32_t i;
+
+	pktv = odp_packet_vector_alloc(pool);
+	if (odp_unlikely(pktv == ODP_PACKET_VECTOR_INVALID)) {
+		odp_packet_free_multi(packets, num);
+		return ODP_PACKET_VECTOR_INVALID;
+	}
+
+	odp_packet_vector_tbl(pktv, &pkt_tbl);
+	for (i = 0; i < num; i++)
+		pkt_tbl[i] = packets[i];
+	odp_packet_vector_size_set(pktv, num);
+
+	return pktv;
+}
+
+static inline int pktin_recv_buf(pktio_entry_t *entry, int pktin_index,
+				 _odp_event_hdr_t *event_hdrs[], int num)
+{
+	const odp_bool_t vector_enabled = entry->in_queue[pktin_index].vector.enable;
+	odp_pool_t pool = ODP_POOL_INVALID;
+	int num_rx;
+
+	if (vector_enabled) {
+		/* Make sure all packets will fit into a single packet vector */
+		if ((int)entry->in_queue[pktin_index].vector.max_size < num)
+			num = entry->in_queue[pktin_index].vector.max_size;
+		pool = entry->in_queue[pktin_index].vector.pool;
+	}
+
+	num_rx = entry->ops->recv(entry, pktin_index, (odp_packet_t *)event_hdrs, num);
+
+	if (!vector_enabled || num_rx < 2)
+		return num_rx;
+
+	odp_packet_vector_t pktv = packet_vector_create((odp_packet_t *)event_hdrs, num_rx, pool);
+
+	if (odp_unlikely(pktv == ODP_PACKET_VECTOR_INVALID))
+		return 0;
+
+	event_hdrs[0] = _odp_packet_vector_to_event_hdr(pktv);
+	return 1;
+}
+
+static int pktin_deq_wd_multi(odp_queue_t queue, _odp_event_hdr_t *event_hdr[], int num,
+			      void *data)
+{
+	int nbr = 0;
+	_odp_event_hdr_t *hdr_tbl[QUEUE_MULTI_MAX];
+	int pkts, i, j;
+	odp_pktin_queue_t *pktin_queue = data;
+	odp_pktio_t pktio = pktin_queue->pktio;
+	int pktin_index   = pktin_queue->index;
+	pktio_entry_t *entry = get_pktio_entry(pktio);
+
+	_ODP_ASSERT(entry != NULL);
+
+	if (odp_unlikely(entry->state != PKTIO_STATE_STARTED))
+		return QPJ_DONE;
+
+	pkts = pktin_recv_buf(entry, pktin_index, hdr_tbl, QUEUE_MULTI_MAX);
+
+	if (pkts <= 0)
+		return 0;
+
+	for (i = 0; i < pkts && nbr < num; i++, nbr++)
+		event_hdr[nbr] = hdr_tbl[i];
+
+	/* Queue the rest for later */
+	for (j = 0; i < pkts; i++, j++)
+		hdr_tbl[j] = hdr_tbl[i];
+
+	if (j) {
+		int num_enq;
+
+		num_enq = odp_queue_enq_multi(queue, (odp_event_t *)hdr_tbl, j);
+
+		if (odp_unlikely(num_enq < j)) {
+			if (odp_unlikely(num_enq < 0))
+				num_enq = 0;
+
+			_ODP_DBG("Interface %s dropped %i packets\n",
+				 entry->name, j - num_enq);
+			_odp_event_free_multi(&event_hdr[num_enq], j - num_enq);
+		}
+	}
+
+	return nbr;
+}
+
 int odp_pktio_start(odp_pktio_t hdl)
 {
 	pktio_entry_t *entry;
@@ -721,23 +816,13 @@ int odp_pktio_start(odp_pktio_t hdl)
 
 	mode = entry->param.in_mode;
 
-	if (mode == ODP_PKTIN_MODE_SCHED) {
-		uint32_t i;
-		uint32_t num = entry->num_in_queue;
-		int index[num];
-		odp_queue_t odpq[num];
-
-		for (i = 0; i < num; i++) {
-			index[i] = i;
-			odpq[i] = entry->in_queue[i].queue;
-
-			if (entry->in_queue[i].queue == ODP_QUEUE_INVALID) {
-				_ODP_ERR("No input queue\n");
-				return -1;
-			}
+	if (mode == ODP_PKTIN_MODE_SCHED || mode == ODP_PKTIN_MODE_QUEUE) {
+		for (uint32_t i = 0; i < entry->num_in_queue; i++) {
+			entry->in_queue[i].poll_job.data = &entry->in_queue[i].pktin;
+			entry->in_queue[i].poll_job.deq = pktin_deq_wd_multi;
+			(void)_odp_queue_fn->add_poll_job(entry->in_queue[i].queue,
+							  &entry->in_queue[i].poll_job);
 		}
-
-		_odp_sched_fn->pktio_start(odp_pktio_index(hdl), num, index, odpq);
 	}
 
 	_ODP_DBG("interface: %s, input queues: %u, output queues: %u\n",
@@ -754,7 +839,6 @@ int odp_pktio_start(odp_pktio_t hdl)
 static int _pktio_stop(pktio_entry_t *entry)
 {
 	int res = 0;
-	odp_pktin_mode_t mode = entry->param.in_mode;
 
 	if (entry->state != PKTIO_STATE_STARTED) {
 		_ODP_ERR("Not started\n");
@@ -767,10 +851,7 @@ static int _pktio_stop(pktio_entry_t *entry)
 	if (res)
 		return -1;
 
-	if (mode == ODP_PKTIN_MODE_SCHED)
-		entry->state = PKTIO_STATE_STOP_PENDING;
-	else
-		entry->state = PKTIO_STATE_STOPPED;
+	entry->state = PKTIO_STATE_STOPPED;
 
 	if (_ODP_PCAPNG)
 		_odp_pcapng_stop(entry);
@@ -831,55 +912,6 @@ odp_pktio_t odp_pktio_lookup(const char *name)
 	return hdl;
 }
 
-static inline odp_packet_vector_t packet_vector_create(odp_packet_t packets[], uint32_t num,
-						       odp_pool_t pool)
-{
-	odp_packet_vector_t pktv;
-	odp_packet_t *pkt_tbl;
-	uint32_t i;
-
-	pktv = odp_packet_vector_alloc(pool);
-	if (odp_unlikely(pktv == ODP_PACKET_VECTOR_INVALID)) {
-		odp_packet_free_multi(packets, num);
-		return ODP_PACKET_VECTOR_INVALID;
-	}
-
-	odp_packet_vector_tbl(pktv, &pkt_tbl);
-	for (i = 0; i < num; i++)
-		pkt_tbl[i] = packets[i];
-	odp_packet_vector_size_set(pktv, num);
-
-	return pktv;
-}
-
-static inline int pktin_recv_buf(pktio_entry_t *entry, int pktin_index,
-				 _odp_event_hdr_t *event_hdrs[], int num)
-{
-	const odp_bool_t vector_enabled = entry->in_queue[pktin_index].vector.enable;
-	odp_pool_t pool = ODP_POOL_INVALID;
-	int num_rx;
-
-	if (vector_enabled) {
-		/* Make sure all packets will fit into a single packet vector */
-		if ((int)entry->in_queue[pktin_index].vector.max_size < num)
-			num = entry->in_queue[pktin_index].vector.max_size;
-		pool = entry->in_queue[pktin_index].vector.pool;
-	}
-
-	num_rx = entry->ops->recv(entry, pktin_index, (odp_packet_t *)event_hdrs, num);
-
-	if (!vector_enabled || num_rx < 2)
-		return num_rx;
-
-	odp_packet_vector_t pktv = packet_vector_create((odp_packet_t *)event_hdrs, num_rx, pool);
-
-	if (odp_unlikely(pktv == ODP_PACKET_VECTOR_INVALID))
-		return 0;
-
-	event_hdrs[0] = _odp_packet_vector_to_event_hdr(pktv);
-	return 1;
-}
-
 static int pktout_enqueue(odp_queue_t queue, _odp_event_hdr_t *event_hdr)
 {
 	odp_packet_t pkt = packet_from_event_hdr(event_hdr);
@@ -909,144 +941,6 @@ static int pktout_enq_multi(odp_queue_t queue, _odp_event_hdr_t *event_hdr[],
 		return nbr;
 
 	return odp_pktout_send(_odp_queue_fn->get_pktout(queue), (odp_packet_t *)event_hdr, num);
-}
-
-static _odp_event_hdr_t *pktin_dequeue(odp_queue_t queue)
-{
-	_odp_event_hdr_t *event_hdr;
-	_odp_event_hdr_t *hdr_tbl[QUEUE_MULTI_MAX];
-	int pkts;
-	odp_pktin_queue_t pktin_queue = _odp_queue_fn->get_pktin(queue);
-	odp_pktio_t pktio = pktin_queue.pktio;
-	int pktin_index   = pktin_queue.index;
-	pktio_entry_t *entry = get_pktio_entry(pktio);
-
-	_ODP_ASSERT(entry != NULL);
-
-	if (_odp_queue_fn->orig_deq_multi(queue, &event_hdr, 1) == 1)
-		return event_hdr;
-
-	if (odp_unlikely(entry->state != PKTIO_STATE_STARTED))
-		return 0;
-
-	pkts = pktin_recv_buf(entry, pktin_index, hdr_tbl, QUEUE_MULTI_MAX);
-
-	if (pkts <= 0)
-		return NULL;
-
-	if (pkts > 1) {
-		int num_enq;
-		int num = pkts - 1;
-
-		num_enq = odp_queue_enq_multi(queue,
-					      (odp_event_t *)&hdr_tbl[1], num);
-
-		if (odp_unlikely(num_enq < num)) {
-			if (odp_unlikely(num_enq < 0))
-				num_enq = 0;
-
-			_ODP_DBG("Interface %s dropped %i packets\n", entry->name, num - num_enq);
-			_odp_event_free_multi(&hdr_tbl[num_enq + 1], num - num_enq);
-		}
-	}
-
-	event_hdr = hdr_tbl[0];
-	return event_hdr;
-}
-
-static int pktin_deq_multi(odp_queue_t queue, _odp_event_hdr_t *event_hdr[],
-			   int num)
-{
-	int nbr;
-	_odp_event_hdr_t *hdr_tbl[QUEUE_MULTI_MAX];
-	int pkts, i, j;
-	odp_pktin_queue_t pktin_queue = _odp_queue_fn->get_pktin(queue);
-	odp_pktio_t pktio = pktin_queue.pktio;
-	int pktin_index   = pktin_queue.index;
-	pktio_entry_t *entry = get_pktio_entry(pktio);
-
-	_ODP_ASSERT(entry != NULL);
-
-	nbr = _odp_queue_fn->orig_deq_multi(queue, event_hdr, num);
-	if (odp_unlikely(nbr > num))
-		_ODP_ABORT("queue_deq_multi req: %d, returned %d\n", num, nbr);
-
-	/** queue already has number of requested buffers,
-	 *  do not do receive in that case.
-	 */
-	if (nbr == num || odp_unlikely(entry->state != PKTIO_STATE_STARTED))
-		return nbr;
-
-	pkts = pktin_recv_buf(entry, pktin_index, hdr_tbl, QUEUE_MULTI_MAX);
-
-	if (pkts <= 0)
-		return nbr;
-
-	for (i = 0; i < pkts && nbr < num; i++, nbr++)
-		event_hdr[nbr] = hdr_tbl[i];
-
-	/* Queue the rest for later */
-	for (j = 0; i < pkts; i++, j++)
-		hdr_tbl[j] = hdr_tbl[i];
-
-	if (j) {
-		int num_enq;
-
-		num_enq = odp_queue_enq_multi(queue, (odp_event_t *)hdr_tbl, j);
-
-		if (odp_unlikely(num_enq < j)) {
-			if (odp_unlikely(num_enq < 0))
-				num_enq = 0;
-
-			_ODP_DBG("Interface %s dropped %i packets\n",
-				 entry->name, j - num_enq);
-			_odp_event_free_multi(&event_hdr[num_enq], j - num_enq);
-		}
-	}
-
-	return nbr;
-}
-
-int _odp_sched_cb_pktin_poll(int pktio_index, int pktin_index,
-			     _odp_event_hdr_t *hdr_tbl[], int num)
-{
-	pktio_entry_t *entry = pktio_entry_by_index(pktio_index);
-	int state = entry->state;
-
-	if (odp_unlikely(state != PKTIO_STATE_STARTED)) {
-		if (state < PKTIO_STATE_ACTIVE ||
-		    state == PKTIO_STATE_STOP_PENDING)
-			return -1;
-
-		_ODP_DBG("Interface %s not started\n", entry->name);
-		return 0;
-	}
-
-	return pktin_recv_buf(entry, pktin_index, hdr_tbl, num);
-}
-
-void _odp_sched_cb_pktio_stop_finalize(int pktio_index)
-{
-	int state;
-	pktio_entry_t *entry = pktio_entry_by_index(pktio_index);
-
-	lock_entry(entry);
-
-	state = entry->state;
-
-	if (state != PKTIO_STATE_STOP_PENDING &&
-	    state != PKTIO_STATE_CLOSE_PENDING) {
-		unlock_entry(entry);
-		_ODP_ERR("Not in a pending state %i\n", state);
-		return;
-	}
-
-	if (state == PKTIO_STATE_STOP_PENDING)
-		entry->state = PKTIO_STATE_STOPPED;
-	else
-		entry->state = PKTIO_STATE_FREE;
-
-	unlock_entry(entry);
 }
 
 static inline uint32_t pktio_maxlen(odp_pktio_t hdl)
@@ -2133,13 +2027,6 @@ int odp_pktin_queue_config(odp_pktio_t pktio, const odp_pktin_queue_param_t *par
 			}
 
 			_odp_queue_fn->set_pktin(queue, pktio, i);
-			if (mode == ODP_PKTIN_MODE_QUEUE)
-				_odp_queue_fn->set_enq_deq_fn(queue,
-							      NULL,
-							      NULL,
-							      pktin_dequeue,
-							      pktin_deq_multi);
-
 			entry->in_queue[i].queue = queue;
 
 		} else {

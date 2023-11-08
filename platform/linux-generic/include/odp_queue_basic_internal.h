@@ -117,8 +117,7 @@ void _odp_queue_spsc_init(queue_entry_t *queue, uint32_t queue_size);
 
 /* Functions for schedulers */
 void _odp_sched_queue_set_status(uint32_t queue_index, int status);
-int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int num,
-			 int update_status);
+int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int num);
 int _odp_sched_queue_empty(uint32_t queue_index);
 
 /* Functions by schedulers */

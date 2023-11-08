@@ -58,7 +58,6 @@ typedef uint32_t ringidx_t;
 #endif
 
 #define ODP_NO_SCHED_QUEUE (ODP_SCHED_SYNC_ORDERED + 1)
-#define FLAG_PKTIN 0x80
 
 typedef struct ODP_ALIGNED_CACHE {
 	struct llnode node;
@@ -70,9 +69,6 @@ typedef struct ODP_ALIGNED_CACHE {
 	uint8_t sched_wait;
 	uint8_t pop_deficit;
 	uint8_t qschst_type;
-	uint8_t pktio_idx;
-	uint8_t rx_queue;
-	uint16_t xoffset;
 	uint8_t sched_prio;
 	ringidx_t prod_read SPLIT_PC;
 	ringidx_t prod_write;
@@ -92,7 +88,6 @@ typedef struct ODP_ALIGNED_CACHE {
 #define cons_type qschst_type
 #endif
 	odp_schedule_group_t sched_grp;
-	uint32_t loop_check[CONFIG_NUM_CPU_IDS];
 } sched_elem_t;
 
 /* Number of scheduling groups */
@@ -142,7 +137,6 @@ typedef struct ODP_ALIGNED_CACHE {
 	bitset_t rvec_free ODP_ALIGNED_CACHE;
 	/* Reordering contexts to allocate from */
 	reorder_context_t rvec[TS_RVEC_SIZE] ODP_ALIGNED_CACHE;
-	uint32_t loop_cnt; /*Counter to check pktio ingress queue dead loop */
 } sched_scalable_thread_state_t;
 
 void _odp_sched_update_enq(sched_elem_t *q, uint32_t actual);
