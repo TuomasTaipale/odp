@@ -964,8 +964,7 @@ static inline int _sched_queue_enq_multi(odp_queue_t handle,
 	return num_enq;
 }
 
-int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num,
-			 int update_status)
+int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num)
 {
 	int num_deq, status, num_enq;
 	ring_st_t *ring_st;
@@ -998,7 +997,7 @@ int _odp_sched_queue_deq(uint32_t queue_index, odp_event_t ev[], int max_num,
 
 	if (!_odp_qpj_has_jobs(&queue->wss)) {
 		/* Empty queue and no jobs to process */
-		if (update_status && status == QUEUE_STATUS_SCHED)
+		if (status == QUEUE_STATUS_SCHED)
 			queue->status = QUEUE_STATUS_NOTSCHED;
 
 		UNLOCK(queue);
@@ -1207,8 +1206,8 @@ static void queue_set_pktin(odp_queue_t handle, odp_pktio_t pktio, int index)
 static void queue_set_enq_deq_func(odp_queue_t handle,
 				   queue_enq_fn_t enq,
 				   queue_enq_multi_fn_t enq_multi,
-				   queue_deq_fn_t deq,
-				   queue_deq_multi_fn_t deq_multi)
+				   queue_deq_fn_t deq ODP_UNUSED,
+				   queue_deq_multi_fn_t deq_multi ODP_UNUSED)
 {
 	queue_entry_t *qentry = qentry_from_handle(handle);
 
@@ -1217,12 +1216,6 @@ static void queue_set_enq_deq_func(odp_queue_t handle,
 
 	if (enq_multi)
 		qentry->enqueue_multi = enq_multi;
-
-	if (deq)
-		qentry->dequeue = deq;
-
-	if (deq_multi)
-		qentry->dequeue_multi = deq_multi;
 }
 
 static int queue_orig_multi(odp_queue_t handle,
