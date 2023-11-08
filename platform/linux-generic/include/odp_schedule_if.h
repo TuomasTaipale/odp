@@ -32,10 +32,6 @@ typedef struct schedule_config_t {
 
 } schedule_config_t;
 
-typedef void (*schedule_pktio_start_fn_t)(int pktio_index,
-					 int num_in_queue,
-					 int in_queue_idx[],
-					 odp_queue_t odpq[]);
 typedef int (*schedule_thr_add_fn_t)(odp_schedule_group_t group, int thr);
 typedef int (*schedule_thr_rem_fn_t)(odp_schedule_group_t group, int thr);
 typedef int (*schedule_num_grps_fn_t)(void);
@@ -57,7 +53,6 @@ typedef void (*schedule_get_config_fn_t)(schedule_config_t *config);
 typedef const _odp_schedule_api_fn_t *(*schedule_sched_api_fn_t)(void);
 
 typedef struct schedule_fn_t {
-	schedule_pktio_start_fn_t   pktio_start;
 	schedule_thr_add_fn_t       thr_add;
 	schedule_thr_rem_fn_t       thr_rem;
 	schedule_num_grps_fn_t      num_grps;
@@ -80,11 +75,6 @@ typedef struct schedule_fn_t {
 
 /* Interface towards the scheduler */
 extern const schedule_fn_t *_odp_sched_fn;
-
-/* Interface for the scheduler */
-int _odp_sched_cb_pktin_poll(int pktio_index, int pktin_index,
-			     _odp_event_hdr_t *hdr_tbl[], int num);
-void _odp_sched_cb_pktio_stop_finalize(int pktio_index);
 
 #ifdef __cplusplus
 }
