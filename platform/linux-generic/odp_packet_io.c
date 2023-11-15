@@ -2235,12 +2235,8 @@ int odp_pktout_queue_config(odp_pktio_t pktio,
 
 			_odp_queue_fn->set_pktout(queue, pktio, i);
 
-			/* Override default enqueue / dequeue functions */
-			_odp_queue_fn->set_enq_deq_fn(queue,
-						      pktout_enqueue,
-						      pktout_enq_multi,
-						      NULL,
-						      NULL);
+			/* Override default enqueue functions */
+			_odp_queue_fn->set_enq_fn(queue, pktout_enqueue, pktout_enq_multi);
 
 			entry->out_queue[i].queue = queue;
 		}
