@@ -137,7 +137,6 @@ void _odp_queue_spsc_init(queue_entry_t *queue, uint32_t queue_size)
 	queue->dequeue = queue_spsc_deq;
 	queue->enqueue_multi = queue_spsc_enq_multi;
 	queue->dequeue_multi = queue_spsc_deq_multi;
-	queue->orig_dequeue_multi = queue_spsc_deq_multi;
 
 	offset = queue->index * (uint64_t)_odp_queue_glb->config.max_queue_size;
 
