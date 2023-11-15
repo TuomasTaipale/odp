@@ -36,11 +36,9 @@ typedef void (*queue_set_pktout_fn_t)(odp_queue_t queue, odp_pktio_t pktio,
 typedef odp_pktin_queue_t (*queue_get_pktin_fn_t)(odp_queue_t queue);
 typedef void (*queue_set_pktin_fn_t)(odp_queue_t queue, odp_pktio_t pktio,
 				     int index);
-typedef void (*queue_set_enq_deq_fn_t)(odp_queue_t queue,
-				       queue_enq_fn_t enq,
-				       queue_enq_multi_fn_t enq_multi,
-				       queue_deq_fn_t deq,
-				       queue_deq_multi_fn_t deq_multi);
+typedef void (*queue_set_enq_fn_t)(odp_queue_t queue,
+				   queue_enq_fn_t enq,
+				   queue_enq_multi_fn_t enq_multi);
 typedef void (*queue_timer_add_fn_t)(odp_queue_t queue);
 typedef void (*queue_timer_rem_fn_t)(odp_queue_t queue);
 
@@ -54,14 +52,11 @@ typedef struct {
 	queue_set_pktout_fn_t set_pktout;
 	queue_get_pktin_fn_t get_pktin;
 	queue_set_pktin_fn_t set_pktin;
-	queue_set_enq_deq_fn_t set_enq_deq_fn;
+	queue_set_enq_fn_t set_enq_fn;
 	queue_timer_add_fn_t timer_add;
 	queue_timer_rem_fn_t timer_rem;
 	_odp_qpj_add_fn_t add_poll_job;
 
-	/* Original queue dequeue multi function (before override). May be used
-	 * by an overriding dequeue function. */
-	queue_deq_multi_fn_t orig_deq_multi;
 } queue_fn_t;
 
 extern const queue_fn_t *_odp_queue_fn;

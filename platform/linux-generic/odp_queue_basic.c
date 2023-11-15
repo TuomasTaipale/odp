@@ -339,7 +339,6 @@ static odp_queue_t queue_create(const char *name,
 				queue->enqueue_multi = lf_fn->enq_multi;
 				queue->dequeue       = lf_fn->deq;
 				queue->dequeue_multi = lf_fn->deq_multi;
-				queue->orig_dequeue_multi = lf_fn->deq_multi;
 			}
 
 			if (type == ODP_QUEUE_TYPE_SCHED)
@@ -1124,7 +1123,6 @@ static int queue_init(queue_entry_t *queue, const char *name,
 	queue->enqueue_multi      = error_enqueue_multi;
 	queue->dequeue            = error_dequeue;
 	queue->dequeue_multi      = error_dequeue_multi;
-	queue->orig_dequeue_multi = error_dequeue_multi;
 
 	if (spsc) {
 		_odp_queue_spsc_init(queue, queue_size);
@@ -1134,7 +1132,6 @@ static int queue_init(queue_entry_t *queue, const char *name,
 			queue->enqueue_multi      = plain_queue_enq_multi;
 			queue->dequeue            = plain_queue_deq;
 			queue->dequeue_multi      = plain_queue_deq_multi;
-			queue->orig_dequeue_multi = plain_queue_deq_multi;
 
 			queue->ring_data = &_odp_queue_glb->ring_data[offset];
 			queue->ring_mask = queue_size - 1;
@@ -1190,11 +1187,8 @@ static void queue_set_pktin(odp_queue_t handle, odp_pktio_t pktio, int index)
 	qentry->pktin.index = index;
 }
 
-static void queue_set_enq_deq_func(odp_queue_t handle,
-				   queue_enq_fn_t enq,
-				   queue_enq_multi_fn_t enq_multi,
-				   queue_deq_fn_t deq ODP_UNUSED,
-				   queue_deq_multi_fn_t deq_multi ODP_UNUSED)
+static void queue_set_enq_func(odp_queue_t handle, queue_enq_fn_t enq,
+			       queue_enq_multi_fn_t enq_multi)
 {
 	queue_entry_t *qentry = qentry_from_handle(handle);
 
@@ -1203,14 +1197,6 @@ static void queue_set_enq_deq_func(odp_queue_t handle,
 
 	if (enq_multi)
 		qentry->enqueue_multi = enq_multi;
-}
-
-static int queue_orig_multi(odp_queue_t handle,
-			    _odp_event_hdr_t **event_hdr, int num)
-{
-	queue_entry_t *queue = qentry_from_handle(handle);
-
-	return queue->orig_dequeue_multi(handle, event_hdr, num);
 }
 
 static int queue_api_enq_multi(odp_queue_t handle,
@@ -1329,8 +1315,7 @@ queue_fn_t _odp_queue_basic_fn = {
 	.set_pktout = queue_set_pktout,
 	.get_pktin = queue_get_pktin,
 	.set_pktin = queue_set_pktin,
-	.set_enq_deq_fn = queue_set_enq_deq_func,
-	.orig_deq_multi = queue_orig_multi,
+	.set_enq_fn = queue_set_enq_func,
 	.timer_add = queue_timer_add,
 	.timer_rem = queue_timer_rem,
 	.add_poll_job = queue_add_poll_job
