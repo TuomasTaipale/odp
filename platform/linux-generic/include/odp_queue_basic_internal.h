@@ -61,7 +61,6 @@ typedef struct ODP_ALIGNED_CACHE queue_entry_s {
 	_odp_qpj_wss_t       wss;
 	int                  status;
 
-	queue_deq_multi_fn_t orig_dequeue_multi;
 	odp_queue_param_t    param;
 	odp_pktin_queue_t    pktin;
 	odp_pktout_queue_t   pktout;
