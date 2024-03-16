@@ -97,6 +97,9 @@ typedef struct {
 	/* Some extra features (e.g. error checks) have been enabled */
 	uint8_t extra_feat;
 
+	/* Has some state that needs to be maintained across tx and/or rx */
+	uint8_t has_state;
+
 	/* Prefetch packet data */
 	uint8_t prefetch;
 
@@ -152,6 +155,12 @@ typedef struct {
 	int mtu;                /* Interface MTU */
 	int num_om;
 	int num_prio;
+
+	struct {
+		odp_packet_tx_compl_mode_t mode;
+		uint32_t nth;
+	} tx_compl;
+
 	char *output_map[MAX_PKTIOS]; /* Destination port mappings for interfaces */
 	odp_schedule_prio_t prio[MAX_PKTIOS]; /* Priority of input queues of an interface */
 
@@ -166,6 +175,10 @@ typedef union ODP_ALIGNED_CACHE {
 		uint64_t rx_drops;
 		/* Packets dropped due to transmit error */
 		uint64_t tx_drops;
+		/* Number of transmit completion start misses (previous incomplete) */
+		uint64_t tx_c_misses;
+		/* Number of transmit completion start failures */
+		uint64_t tx_c_fails;
 		/* Number of failed packet copies */
 		uint64_t copy_fails;
 		/* Dummy sum of packet data */
@@ -175,9 +188,22 @@ typedef union ODP_ALIGNED_CACHE {
 	uint8_t padding[ODP_CACHE_LINE_SIZE];
 } stats_t;
 
+typedef struct {
+	odp_packet_tx_compl_opt_t opt;
+	odp_pktio_t pktio;
+	int ival;
+	int n;
+	uint8_t is_waiting;
+} tx_compl_t;
+
+typedef struct {
+	tx_compl_t tx_compl;
+} state_t;
+
 /* Thread specific data */
 typedef struct thread_args_t {
 	stats_t stats;
+	state_t state;
 
 	struct {
 		odp_pktin_queue_t pktin;
@@ -225,6 +251,7 @@ typedef struct {
 		odp_pktout_queue_t pktout[MAX_QUEUES];
 		odp_queue_t rx_q[MAX_QUEUES];
 		odp_queue_t tx_q[MAX_QUEUES];
+		odp_queue_t compl_q;
 		int num_rx_thr;
 		int num_tx_thr;
 		int num_rx_queue;
@@ -489,16 +516,82 @@ static inline int process_extra_features(const appl_args_t *appl_args, odp_packe
 	return pkts;
 }
 
+static inline int get_next_n(const tx_compl_t *tx_c, int num, uint8_t is_tx)
+{
+	return is_tx ? ODPH_MAX(tx_c->ival - (num - tx_c->n), 1) : tx_c->n - num;
+}
+
+static inline void handle_tx_event_compl(tx_compl_t *tx_c, odp_packet_t pkts[], int num,
+					 int tx_idx, stats_t *stats)
+{
+	const uint8_t is_tx = tx_c->n <= num;
+	odp_packet_t pkt;
+
+	if (is_tx) {
+		pkt = pkts[tx_c->n - 1];
+		tx_c->opt.queue = gbl_args->pktios[tx_idx].compl_q;
+
+		if (odp_packet_tx_compl_request(pkt, &tx_c->opt) < 0)
+			stats->s.tx_c_fails++;
+	}
+
+	tx_c->n = get_next_n(tx_c, num, is_tx);
+}
+
+static inline void handle_tx_poll_compl(tx_compl_t *tx_c, odp_packet_t pkts[], int num, int tx_idx,
+					stats_t *stats)
+{
+	const uint8_t is_tx = tx_c->n <= num;
+	odp_packet_t pkt;
+
+	if (tx_c->is_waiting && odp_packet_tx_compl_done(tx_c->pktio, tx_c->opt.compl_id) > 0)
+		tx_c->is_waiting = 0;
+
+	if (is_tx) {
+		if (!tx_c->is_waiting) {
+			pkt = pkts[tx_c->n - 1];
+
+			if (odp_packet_tx_compl_request(pkt, &tx_c->opt) == 0) {
+				tx_c->pktio = gbl_args->pktios[tx_idx].pktio;
+				tx_c->is_waiting = 1;
+			} else {
+				stats->s.tx_c_fails++;
+			}
+		} else {
+			stats->s.tx_c_misses++;
+		}
+	}
+
+	tx_c->n = get_next_n(tx_c, num, is_tx);
+}
+
+static inline void handle_tx_state(state_t *state, odp_packet_t pkts[], int num, int tx_idx,
+				   stats_t *stats)
+{
+	tx_compl_t *tx_c = &state->tx_compl;
+
+	if (tx_c->opt.mode == ODP_PACKET_TX_COMPL_EVENT)
+		handle_tx_event_compl(tx_c, pkts, num, tx_idx, stats);
+
+	if (tx_c->opt.mode == ODP_PACKET_TX_COMPL_POLL)
+		handle_tx_poll_compl(tx_c, pkts, num, tx_idx, stats);
+}
+
 static inline void send_packets(odp_packet_t *pkt_tbl,
 				int pkts,
 				int use_event_queue,
+				int tx_idx,
 				odp_queue_t tx_queue,
 				odp_pktout_queue_t pktout_queue,
+				state_t *state,
 				stats_t *stats)
 {
 	int sent;
 	unsigned int tx_drops;
 	int i;
+
+	if (odp_unlikely(state != NULL))
+		handle_tx_state(state, pkt_tbl, pkts, tx_idx, stats);
 
 	if (odp_unlikely(use_event_queue))
 		sent = event_queue_send(tx_queue, pkt_tbl, pkts);
@@ -519,6 +612,17 @@ static inline void send_packets(odp_packet_t *pkt_tbl,
 	stats->s.packets += pkts;
 }
 
+static int handle_rx_state(state_t *state, odp_event_t evs[], int num)
+{
+	if (state->tx_compl.opt.mode != ODP_PACKET_TX_COMPL_EVENT ||
+	    odp_event_type(evs[0]) != ODP_EVENT_PACKET_TX_COMPL)
+		return num;
+
+	odp_event_free_multi(evs, num);
+
+	return 0;
+}
+
 /*
  * Packet IO worker thread using scheduled queues and vector mode.
  *
@@ -536,6 +640,7 @@ static int run_worker_sched_mode_vector(void *arg)
 	thread_args_t *thr_args = arg;
 	stats_t *stats = &thr_args->stats;
 	const appl_args_t *appl_args = &gbl_args->appl;
+	state_t *state = appl_args->has_state ? &thr_args->state : NULL;
 	int use_event_queue = gbl_args->appl.out_mode;
 	pktin_mode_t in_mode = gbl_args->appl.in_mode;
 
@@ -584,20 +689,24 @@ static int run_worker_sched_mode_vector(void *arg)
 
 		for (i = 0; i < events; i++) {
 			odp_packet_vector_t pkt_vec = ODP_PACKET_VECTOR_INVALID;
-			odp_packet_t *pkt_tbl;
+			odp_packet_t *pkt_tbl = NULL;
 			odp_packet_t pkt;
 			int src_idx, dst_idx;
-			int pkts;
+			int pkts = 0;
 
 			if (odp_event_type(ev_tbl[i]) == ODP_EVENT_PACKET) {
 				pkt = odp_packet_from_event(ev_tbl[i]);
 				pkt_tbl = &pkt;
 				pkts = 1;
-			} else {
-				ODPH_ASSERT(odp_event_type(ev_tbl[i]) == ODP_EVENT_PACKET_VECTOR);
+			} else if (odp_event_type(ev_tbl[i]) == ODP_EVENT_PACKET_VECTOR) {
 				pkt_vec = odp_packet_vector_from_event(ev_tbl[i]);
 				pkts = odp_packet_vector_tbl(pkt_vec, &pkt_tbl);
+			} else if (state != NULL) {
+				pkts = handle_rx_state(state, ev_tbl, events);
 			}
+
+			if (odp_unlikely(pkts <= 0))
+				continue;
 
 			prefetch_data(appl_args->prefetch, pkt_tbl, pkts);
 
@@ -615,11 +724,8 @@ static int run_worker_sched_mode_vector(void *arg)
 			dst_idx = gbl_args->dst_port_from_idx[src_idx];
 			fill_eth_addrs(pkt_tbl, pkts, dst_idx);
 
-			send_packets(pkt_tbl, pkts,
-				     use_event_queue,
-				     tx_queue[dst_idx],
-				     pktout[dst_idx],
-				     stats);
+			send_packets(pkt_tbl, pkts, use_event_queue, dst_idx, tx_queue[dst_idx],
+				     pktout[dst_idx], state, stats);
 
 			if (pkt_vec != ODP_PACKET_VECTOR_INVALID)
 				odp_packet_vector_free(pkt_vec);
@@ -686,6 +792,7 @@ static int run_worker_sched_mode(void *arg)
 	thread_args_t *thr_args = arg;
 	stats_t *stats = &thr_args->stats;
 	const appl_args_t *appl_args = &gbl_args->appl;
+	state_t *state = appl_args->has_state ? &thr_args->state : NULL;
 	int use_event_queue = gbl_args->appl.out_mode;
 	pktin_mode_t in_mode = gbl_args->appl.in_mode;
 
@@ -747,6 +854,12 @@ static int run_worker_sched_mode(void *arg)
 		if (pkts <= 0)
 			continue;
 
+		if (odp_unlikely(state != NULL))
+			pkts = handle_rx_state(state, ev_tbl, pkts);
+
+		if (odp_unlikely(pkts <= 0))
+			continue;
+
 		odp_packet_from_event_multi(pkt_tbl, ev_tbl, pkts);
 
 		prefetch_data(appl_args->prefetch, pkt_tbl, pkts);
@@ -762,11 +875,8 @@ static int run_worker_sched_mode(void *arg)
 		dst_idx = gbl_args->dst_port_from_idx[src_idx];
 		fill_eth_addrs(pkt_tbl, pkts, dst_idx);
 
-		send_packets(pkt_tbl, pkts,
-			     use_event_queue,
-			     tx_queue[dst_idx],
-			     pktout[dst_idx],
-			     stats);
+		send_packets(pkt_tbl, pkts, use_event_queue, dst_idx, tx_queue[dst_idx],
+			     pktout[dst_idx], state, stats);
 	}
 
 	/*
@@ -827,6 +937,7 @@ static int run_worker_plain_queue_mode(void *arg)
 	thread_args_t *thr_args = arg;
 	stats_t *stats = &thr_args->stats;
 	const appl_args_t *appl_args = &gbl_args->appl;
+	state_t *state = appl_args->has_state ? &thr_args->state : NULL;
 	int use_event_queue = gbl_args->appl.out_mode;
 	int i;
 
@@ -875,10 +986,7 @@ static int run_worker_plain_queue_mode(void *arg)
 
 		fill_eth_addrs(pkt_tbl, pkts, dst_idx);
 
-		send_packets(pkt_tbl, pkts,
-			     use_event_queue,
-			     tx_queue,
-			     pktout,
+		send_packets(pkt_tbl, pkts, use_event_queue, dst_idx, tx_queue, pktout, state,
 			     stats);
 	}
 
@@ -928,6 +1036,7 @@ static int run_worker_direct_mode(void *arg)
 	thread_args_t *thr_args = arg;
 	stats_t *stats = &thr_args->stats;
 	const appl_args_t *appl_args = &gbl_args->appl;
+	state_t *state = appl_args->has_state ? &thr_args->state : NULL;
 	int use_event_queue = gbl_args->appl.out_mode;
 
 	thr = odp_thread_id();
@@ -971,10 +1080,7 @@ static int run_worker_direct_mode(void *arg)
 
 		fill_eth_addrs(pkt_tbl, pkts, dst_idx);
 
-		send_packets(pkt_tbl, pkts,
-			     use_event_queue,
-			     tx_queue,
-			     pktout,
+		send_packets(pkt_tbl, pkts, use_event_queue, dst_idx, tx_queue, pktout, state,
 			     stats);
 	}
 
@@ -1051,6 +1157,7 @@ static int create_pktio(const char *dev, int idx, int num_rx, int num_tx, odp_po
 	odp_pktio_param_t pktio_param;
 	odp_schedule_sync_t  sync_mode;
 	odp_pktio_capability_t pktio_capa;
+	odp_queue_param_t compl_queue;
 	odp_pktio_config_t config;
 	odp_pktin_queue_param_t pktin_param;
 	odp_pktout_queue_param_t pktout_param;
@@ -1113,6 +1220,29 @@ static int create_pktio(const char *dev, int idx, int num_rx, int num_tx, odp_po
 		config.pktout.bit.ipv4_chksum_ena = 1;
 		config.pktout.bit.udp_chksum_ena  = 1;
 		config.pktout.bit.tcp_chksum_ena  = 1;
+	}
+
+	if (gbl_args->appl.tx_compl.mode != ODP_PACKET_TX_COMPL_DISABLED) {
+		if (gbl_args->appl.tx_compl.mode == ODP_PACKET_TX_COMPL_EVENT &&
+		    !(pktio_capa.tx_compl.mode_event && pktio_capa.tx_compl.queue_type_sched)) {
+			ODPH_ERR("Transmit event completion not supported: %s\n", dev);
+			return -1;
+		}
+
+		if (gbl_args->appl.tx_compl.mode == ODP_PACKET_TX_COMPL_POLL &&
+		    !(pktio_capa.tx_compl.mode_poll &&
+		      pktio_capa.tx_compl.max_compl_id >= (uint32_t)num_tx - 1)) {
+			ODPH_ERR("Transmit poll completion not supported: %s\n", dev);
+			return -1;
+		}
+
+		if (gbl_args->appl.tx_compl.mode == ODP_PACKET_TX_COMPL_EVENT)
+			config.tx_compl.mode_event = 1;
+
+		if (gbl_args->appl.tx_compl.mode == ODP_PACKET_TX_COMPL_POLL) {
+			config.tx_compl.mode_poll = 1;
+			config.tx_compl.max_compl_id = num_tx - 1;
+		}
 	}
 
 	/* Provide hint to pktio that packet references are not used */
@@ -1193,6 +1323,20 @@ static int create_pktio(const char *dev, int idx, int num_rx, int num_tx, odp_po
 		pktin_param.queue_param.sched.prio  = prio;
 		pktin_param.queue_param.sched.sync  = sync_mode;
 		pktin_param.queue_param.sched.group = group;
+
+		if (gbl_args->appl.tx_compl.mode == ODP_PACKET_TX_COMPL_EVENT) {
+			odp_queue_param_init(&compl_queue);
+			compl_queue.type = ODP_QUEUE_TYPE_SCHED;
+			compl_queue.sched.prio = prio;
+			compl_queue.sched.sync = sync_mode;
+			compl_queue.sched.group = group;
+			gbl_args->pktios[idx].compl_q = odp_queue_create(NULL, &compl_queue);
+
+			if (gbl_args->pktios[idx].compl_q == ODP_QUEUE_INVALID) {
+				ODPH_ERR("Creating completion queue failed: %s\n", dev);
+				return -1;
+			}
+		}
 	}
 
 	if (num_rx > (int)pktio_capa.max_input_queues) {
@@ -1303,7 +1447,7 @@ static int print_speed_stats(int num_workers, stats_t **thr_stats,
 	uint64_t pkts = 0;
 	uint64_t pkts_prev = 0;
 	uint64_t pps;
-	uint64_t rx_drops, tx_drops, copy_fails;
+	uint64_t rx_drops, tx_drops, tx_c_misses, tx_c_fails, copy_fails;
 	uint64_t maximum_pps = 0;
 	int i;
 	int elapsed = 0;
@@ -1321,6 +1465,8 @@ static int print_speed_stats(int num_workers, stats_t **thr_stats,
 		pkts = 0;
 		rx_drops = 0;
 		tx_drops = 0;
+		tx_c_misses = 0;
+		tx_c_fails = 0;
 		copy_fails = 0;
 
 		sleep(timeout);
@@ -1329,6 +1475,8 @@ static int print_speed_stats(int num_workers, stats_t **thr_stats,
 			pkts += thr_stats[i]->s.packets;
 			rx_drops += thr_stats[i]->s.rx_drops;
 			tx_drops += thr_stats[i]->s.tx_drops;
+			tx_c_misses += thr_stats[i]->s.tx_c_misses;
+			tx_c_fails += thr_stats[i]->s.tx_c_fails;
 			copy_fails += thr_stats[i]->s.copy_fails;
 		}
 		if (stats_enabled) {
@@ -1340,6 +1488,10 @@ static int print_speed_stats(int num_workers, stats_t **thr_stats,
 
 			if (gbl_args->appl.packet_copy)
 				printf("%" PRIu64 " copy fails, ", copy_fails);
+
+			if (gbl_args->appl.tx_compl.mode != ODP_PACKET_TX_COMPL_DISABLED)
+				printf("%" PRIu64 " tx compl misses, %" PRIu64 " tx compl fails, ",
+				       tx_c_misses, tx_c_fails);
 
 			printf("%" PRIu64 " rx drops, %" PRIu64 " tx drops\n",
 			       rx_drops, tx_drops);
@@ -1470,7 +1622,8 @@ static void bind_workers(void)
 				thr_args->num_pktio++;
 
 				gbl_args->pktios[rx_idx].num_rx_thr++;
-				gbl_args->pktios[tx_idx].num_tx_thr++;
+				thr_args->state.tx_compl.opt.compl_id =
+					gbl_args->pktios[tx_idx].num_tx_thr++;
 
 				thr++;
 				if (thr >= num_workers)
@@ -1491,7 +1644,8 @@ static void bind_workers(void)
 				thr_args->num_pktio++;
 
 				gbl_args->pktios[rx_idx].num_rx_thr++;
-				gbl_args->pktios[tx_idx].num_tx_thr++;
+				thr_args->state.tx_compl.opt.compl_id =
+					gbl_args->pktios[tx_idx].num_tx_thr++;
 
 				rx_idx++;
 				if (rx_idx >= if_count)
@@ -1560,6 +1714,15 @@ static void bind_queues(void)
 	}
 
 	printf("\n");
+}
+
+static void init_state(const appl_args_t *args, state_t *state)
+{
+	/* Completion ID for thread state was assigned already earlier. */
+	state->tx_compl.opt.mode = args->tx_compl.mode;
+	state->tx_compl.ival = args->tx_compl.nth;
+	state->tx_compl.n = state->tx_compl.ival;
+	state->tx_compl.is_waiting = 0;
 }
 
 static void init_port_lookup_tbl(void)
@@ -1683,6 +1846,11 @@ static void usage(char *progname)
 	       "  -F, --prefetch <num>    Prefetch packet data in 64 byte multiples (default 1).\n"
 	       "  -f, --flow_aware        Enable flow aware scheduling.\n"
 	       "  -T, --input_ts          Enable packet input timestamping.\n"
+	       "  -C, --tx_compl <mode,n> Enable transmit completion with a specified completion\n"
+	       "                          mode for nth packet, however once per send burst at\n"
+	       "                          most (comma-separated, no spaces).\n"
+	       "                          0: Event completion mode\n"
+	       "                          1: Poll completion mode\n"
 	       "  -v, --verbose           Verbose output.\n"
 	       "  -V, --verbose_pkt       Print debug information on every received packet.\n"
 	       "  -h, --help              Display help and exit.\n\n"
@@ -1701,7 +1869,7 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
 	int opt;
 	int long_index;
 	char *token;
-	char *tmp_str;
+	char *tmp_str, *tmp;
 	size_t str_len, len;
 	int i;
 	static const struct option longopts[] = {
@@ -1737,6 +1905,7 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
 		{"prefetch", required_argument, NULL, 'F'},
 		{"flow_aware", no_argument, NULL, 'f'},
 		{"input_ts", no_argument, NULL, 'T'},
+		{"tx_compl", required_argument, NULL, 'C'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"verbose_pkt", no_argument, NULL, 'V'},
 		{"help", no_argument, NULL, 'h'},
@@ -1744,7 +1913,7 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
 	};
 
 	static const char *shortopts = "+c:t:a:i:m:o:O:r:d:s:e:k:g:G:I:"
-				       "b:q:p:R:y:n:l:L:w:x:z:M:F:uPfTvVh";
+				       "b:q:p:R:y:n:l:L:w:x:z:M:F:uPfTC:vVh";
 
 	appl_args->time = 0; /* loop forever if time to run is 0 */
 	appl_args->accuracy = 1; /* get and print pps stats second */
@@ -2022,6 +2191,34 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
 		case 'T':
 			appl_args->input_ts = 1;
 			break;
+		case 'C':
+			if (strlen(optarg) == 0) {
+				ODPH_ERR("Bad tx compl string\n");
+				exit(EXIT_FAILURE);
+			}
+
+			tmp_str = strdup(optarg);
+
+			if (tmp_str == NULL) {
+				ODPH_ERR("Tx compl string duplication failed\n");
+				exit(EXIT_FAILURE);
+			}
+
+			tmp = strtok(tmp_str, ",");
+
+			if (tmp != NULL) {
+				i = atoi(tmp);
+
+				if (i == 0)
+					appl_args->tx_compl.mode = ODP_PACKET_TX_COMPL_EVENT;
+				else if (i == 1)
+					appl_args->tx_compl.mode = ODP_PACKET_TX_COMPL_POLL;
+
+				appl_args->tx_compl.nth = atoi(strstr(optarg, ",") + 1);
+			}
+
+			free(tmp_str);
+			break;
 		case 'v':
 			appl_args->verbose = 1;
 			break;
@@ -2063,13 +2260,32 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
 		exit(EXIT_FAILURE);
 	}
 
+	if (appl_args->tx_compl.mode != ODP_PACKET_TX_COMPL_DISABLED &&
+	    appl_args->tx_compl.nth == 0) {
+		ODPH_ERR("Invalid packet interval for transmit completion: %u\n",
+			 appl_args->tx_compl.nth);
+		exit(EXIT_FAILURE);
+	}
+
+	if (appl_args->tx_compl.mode == ODP_PACKET_TX_COMPL_EVENT &&
+	    (appl_args->in_mode == PLAIN_QUEUE || appl_args->in_mode == DIRECT_RECV)) {
+		ODPH_ERR("Transmit event completion mode not supported with plain queue or direct "
+			 "input modes\n");
+		exit(EXIT_FAILURE);
+	}
+
 	if (appl_args->burst_rx == 0)
 		appl_args->burst_rx = MAX_PKT_BURST;
 
 	appl_args->extra_feat = 0;
 	if (appl_args->error_check || appl_args->chksum ||
-	    appl_args->packet_copy || appl_args->data_rd || appl_args->verbose_pkt)
+	    appl_args->packet_copy || appl_args->data_rd ||
+	    appl_args->tx_compl.mode == ODP_PACKET_TX_COMPL_EVENT || appl_args->verbose_pkt)
 		appl_args->extra_feat = 1;
+
+	appl_args->has_state = 0;
+	if (appl_args->tx_compl.mode != ODP_PACKET_TX_COMPL_DISABLED)
+		appl_args->has_state = 1;
 
 	optind = 1;		/* reset 'extern optind' from the getopt lib */
 }
@@ -2129,12 +2345,13 @@ static void print_options(void)
 	printf("Number of pools:    %i\n", appl_args->pool_per_if ?
 					   appl_args->if_count : 1);
 
-	if (appl_args->extra_feat) {
-		printf("Extra features:     %s%s%s%s%s\n",
+	if (appl_args->extra_feat || appl_args->has_state) {
+		printf("Extra features:     %s%s%s%s%s%s\n",
 		       appl_args->error_check ? "error_check " : "",
 		       appl_args->chksum ? "chksum " : "",
 		       appl_args->packet_copy ? "packet_copy " : "",
 		       appl_args->data_rd ? "data_rd" : "",
+		       appl_args->tx_compl.mode != ODP_PACKET_TX_COMPL_DISABLED ? "tx_compl" : "",
 		       appl_args->verbose_pkt ? "verbose_pkt" : "");
 	}
 
@@ -2176,7 +2393,11 @@ static void gbl_args_init(args_t *args)
 
 		for (queue = 0; queue < MAX_QUEUES; queue++)
 			args->pktios[pktio].rx_q[queue] = ODP_QUEUE_INVALID;
+
+		args->pktios[pktio].compl_q = ODP_QUEUE_INVALID;
 	}
+
+	args->appl.tx_compl.mode = ODP_PACKET_TX_COMPL_DISABLED;
 }
 
 static void create_groups(int num, odp_schedule_group_t *group)
@@ -2607,6 +2828,7 @@ int main(int argc, char *argv[])
 		int num_join;
 		int mode = gbl_args->appl.group_mode;
 
+		init_state(&gbl_args->appl, &gbl_args->thread_args[i].state);
 		odph_thread_param_init(&thr_param[i]);
 		thr_param[i].start    = thr_run_func;
 		thr_param[i].arg      = &gbl_args->thread_args[i];
@@ -2699,6 +2921,9 @@ int main(int argc, char *argv[])
 			printf("Pktio %s extra statistics:\n", gbl_args->appl.if_names[i]);
 			odp_pktio_extra_stats_print(pktio);
 		}
+
+		if (gbl_args->pktios[i].compl_q != ODP_QUEUE_INVALID)
+			(void)odp_queue_destroy(gbl_args->pktios[i].compl_q);
 
 		if (odp_pktio_close(pktio)) {
 			ODPH_ERR("Pktio close failed: %s\n", gbl_args->appl.if_names[i]);
