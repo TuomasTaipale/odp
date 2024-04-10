@@ -492,6 +492,12 @@ if ODP_PKTIO_PCAP
 __LIB__libodp_linux_la_LIBADD += $(PCAP_LIBS)
 endif
 
+pkglibexec_PROGRAMS = odp_fdserver_runner
+
+odp_fdserver_runner_SOURCES = odp_fdserver_runner.c
+
+AM_CFLAGS += -DFDSERVER_PATH='"@libexecdir@/$(PACKAGE)/odp_fdserver_runner"'
+
 CHECK_GLOBALS_REGEX = " (odp_|_odp_|_deprecated_odp_|miniz_|mz_|tdefl_|tinfl_|mp_hdlr_init_odp_pool_ops)"
 
 TESTS_ENVIRONMENT = \

@@ -1,2 +1,3 @@
 libodp-linux.pc
+odp_fdserver_runner
 odp_libconfig_config.h
