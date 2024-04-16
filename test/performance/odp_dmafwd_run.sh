@@ -4,8 +4,8 @@
 # Copyright (c) 2023 Nokia
 #
 
-TEST_DIR="${TEST_DIR:-$PWD}"
-TEST_SRC_DIR=$(dirname $0)
+TEST_DIR="${TEST_DIR:-${PWD}}"
+TEST_SRC_DIR=$(dirname ${0})
 PERF_TEST_DIR=platform/${ODP_PLATFORM}/test/performance
 PERF_TEST_DIR=${TEST_SRC_DIR}/../../${PERF_TEST_DIR}
 
@@ -19,13 +19,13 @@ check_env()
 	if [ -f "./pktio_env" ]; then
 		. ./pktio_env
 	elif  [ "${ODP_PLATFORM}" = "" ]; then
-		echo "$0: ERROR: ODP_PLATFORM must be defined"
+		echo "${0}: ERROR: ODP_PLATFORM must be defined"
 		return 1
 	elif [ -f ${PERF_TEST_DIR}/dmafwd/pktio_env ]; then
 		. ${PERF_TEST_DIR}/dmafwd/pktio_env
 	else
 		echo "ERROR: unable to find pktio_env"
-		echo "pktio_env has to be in current directory or in platform/\$ODP_PLATFORM/test/"
+		echo "pktio_env has to be in current directory or in platform/\${ODP_PLATFORM}/test/"
 		echo "ODP_PLATFORM=\"${ODP_PLATFORM}\""
 		return 1
 	fi
@@ -35,9 +35,9 @@ check_env()
 
 check_result()
 {
-	if [ $1 -eq 0 ]; then
-		TESTS_RUN=`expr $TESTS_RUN + 1`
-	elif [ $1 -eq 1 ]; then
+	if [ ${1} -eq 0 ]; then
+		TESTS_RUN=`expr ${TESTS_RUN} + 1`
+	elif [ ${1} -eq 1 ]; then
 		echo "Test FAILED"
 		return 1
 	else
@@ -50,7 +50,7 @@ check_result()
 
 check_exit()
 {
-	if [ $TESTS_RUN -eq 0 ]; then
+	if [ ${TESTS_RUN} -eq 0 ]; then
 		exit 77
 	fi
 
@@ -72,7 +72,7 @@ fi
 echo "${BIN_NAME}: SW copy"
 echo "==================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 0
-check_result $?
+check_result ${?}
 
 if [ ${?} -ne 0 ]; then
 	cleanup_interfaces
@@ -82,7 +82,7 @@ fi
 echo "${BIN_NAME}: DMA copy event"
 echo "===================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 1
-check_result $?
+check_result ${?}
 
 if [ ${?} -ne 0 ]; then
 	cleanup_interfaces
@@ -92,7 +92,7 @@ fi
 echo "${BIN_NAME}: DMA copy poll"
 echo "===================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 2
-check_result $?
+check_result ${?}
 
 if [ ${?} -ne 0 ]; then
 	cleanup_interfaces
