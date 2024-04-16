@@ -20,15 +20,17 @@ check_env()
 		. ./pktio_env
 	elif  [ "${ODP_PLATFORM}" = "" ]; then
 		echo "$0: ERROR: ODP_PLATFORM must be defined"
-		exit 1
+		return 1
 	elif [ -f ${PERF_TEST_DIR}/dmafwd/pktio_env ]; then
 		. ${PERF_TEST_DIR}/dmafwd/pktio_env
 	else
 		echo "ERROR: unable to find pktio_env"
 		echo "pktio_env has to be in current directory or in platform/\$ODP_PLATFORM/test/"
 		echo "ODP_PLATFORM=\"${ODP_PLATFORM}\""
-		exit 1
+		return 1
 	fi
+
+	return 0
 }
 
 check_result()
@@ -36,8 +38,8 @@ check_result()
 	if [ $1 -eq 0 ]; then
 		TESTS_RUN=`expr $TESTS_RUN + 1`
 	elif [ $1 -eq 1 ]; then
-		echo "Test FAILED, exiting"
-		exit 1
+		echo "Test FAILED"
+		return 1
 	else
 		echo "Test SKIPPED"
 		return 0
@@ -56,18 +58,46 @@ check_exit()
 }
 
 check_env
+
+if [ ${?} -ne 0 ]; then
+	exit 1
+fi
+
 setup_interfaces
+
+if [ ${?} -ne 0 ]; then
+	exit 1
+fi
+
 echo "${BIN_NAME}: SW copy"
 echo "==================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 0
 check_result $?
+
+if [ ${?} -ne 0 ]; then
+	cleanup_interfaces
+	exit 1
+fi
+
 echo "${BIN_NAME}: DMA copy event"
 echo "===================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 1
 check_result $?
+
+if [ ${?} -ne 0 ]; then
+	cleanup_interfaces
+	exit 1
+fi
+
 echo "${BIN_NAME}: DMA copy poll"
 echo "===================="
 ./${BIN_NAME}${EXEEXT} -i ${IF0} -b ${BATCH} -T ${TIME} -t 2
 check_result $?
+
+if [ ${?} -ne 0 ]; then
+	cleanup_interfaces
+	exit 1
+fi
+
 cleanup_interfaces
 check_exit
