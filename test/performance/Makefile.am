@@ -97,7 +97,7 @@ odp_random_SOURCES = odp_random.c
 odp_sched_perf_SOURCES = odp_sched_perf.c
 odp_stress_SOURCES = odp_stress.c
 odp_timer_accuracy_SOURCES = odp_timer_accuracy.c
-odp_timer_perf_SOURCES = odp_timer_perf.c
+odp_timer_perf_SOURCES = odp_timer_perf.c odp_ipc.h odp_ipc.c
 
 if LIBCONFIG
 odp_ipsecfwd_SOURCES = odp_ipsecfwd.c
