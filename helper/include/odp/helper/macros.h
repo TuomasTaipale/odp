@@ -57,6 +57,25 @@ extern "C" {
 	})
 
 /**
+ * Return division of two numbers rounded up to the closest integer
+ */
+#define ODPH_ROUNDUP_DIV(numer, denom)			\
+	__extension__ ({				\
+		__typeof__(numer) n = (numer);		\
+		__typeof__(denom) d = (denom);		\
+		((n) > 0) != ((d) > 0) ?		\
+			(n) / (d) :			\
+			((n) + ((d) > 0 ?		\
+				(d) - 1 :		\
+				(d) + 1)) / (d);	\
+	})
+
+/**
+ * Round up 'x' to alignment 'align'
+ */
+#define ODPH_ROUNDUP_ALIGN(x, align) ((ODPH_ABS(align)) * (ODPH_ROUNDUP_DIV((x), (align))))
+
+/**
  * @}
  */
 
