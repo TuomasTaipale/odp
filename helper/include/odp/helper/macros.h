@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright(C) 2023 Nokia
+ * Copyright (c) 2023-2025 Nokia
  */
 
 /**
@@ -48,12 +48,12 @@ extern "C" {
 	})
 
 /**
- * Return absolute value of signed variable
+ * Return absolute value of a variable
  */
 #define ODPH_ABS(v)				\
 	__extension__ ({			\
 		__typeof__(v) abs_v = (v);	\
-		abs_v < 0 ? -abs_v : abs_v;	\
+		abs_v > 0 ? abs_v : -abs_v;	\
 	})
 
 /**
