@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright (c) 2021-2023 Nokia
+ * Copyright (c) 2021-2025 Nokia
  * Copyright (c) 2021 Marvell
  */
 
@@ -512,6 +512,37 @@ typedef struct odp_ml_shape_info_t {
 
 } odp_ml_shape_info_t;
 
+/**
+ * Quantization parameters
+ *
+ * These parameters are used to convert between floating point and integer data. Scale and zerop
+ * values can be used directly with the odp_ml_fp32_from_*() and odp_ml_fp32_to_*() functions.
+ */
+typedef struct odp_ml_quant_param_t {
+	/** TODO: Is there a need for additional odp_ml_data_type_t fields to tell which one of the
+	 *  union values are the active ones or is it evident from some other context? */
+
+	/** Quantization scale */
+	union {
+		float s_fp32;
+
+	} scale;
+
+	/** Quantization zero point */
+	union {
+		int32_t z_i32;
+
+	} zerop;
+
+} odp_ml_quant_param_t;
+
+/** Quantization information */
+typedef struct odp_ml_quant_info_t {
+	/** Common quantization parameters */
+	odp_ml_quant_param_t common;
+
+} odp_ml_quant_info_t;
+
 /** Model input information */
 typedef struct odp_ml_input_info_t {
 	/** Model input name */
@@ -525,6 +556,9 @@ typedef struct odp_ml_input_info_t {
 
 	/** Model input data shape */
 	odp_ml_shape_info_t shape;
+
+	/** Quantization information */
+	odp_ml_quant_info_t quant_info;
 
 } odp_ml_input_info_t;
 
@@ -541,6 +575,9 @@ typedef struct odp_ml_output_info_t {
 
 	/** Model output data shape */
 	odp_ml_shape_info_t shape;
+
+	/** Quantization information */
+	odp_ml_quant_info_t quant_info;
 
 } odp_ml_output_info_t;
 
@@ -574,6 +611,34 @@ typedef struct odp_ml_model_info_t {
 
 	/** Number of model outputs */
 	uint32_t num_outputs;
+
+	/** Auxiliary information regarding the model and its inputs / outputs */
+	union {
+		/** Auxiliary bit fields */
+		struct {
+			/**
+			 * Quantization information provision
+			 *
+			 * When set to 1, model input / output information provides quantization
+			 * information.
+			 *
+			 * When set to 0, no quantization information is provided.
+			 *
+			 * See odp_ml_quant_info_t, odp_ml_input_info_t::quant_info and
+			 * odp_ml_output_info_t::quant_info.
+			 */
+			uint32_t quant_info : 1;
+
+		};
+
+		/**
+		 * All bits of the bit field structure
+		 *
+		 * This field can be used for bitwise operations over the entire structure.
+		 */
+		uint32_t all;
+
+	} auxiliary;
 
 } odp_ml_model_info_t;
 
