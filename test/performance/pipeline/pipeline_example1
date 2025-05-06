@@ -1,0 +1,141 @@
+queues: (
+	{
+		name: "queue1";
+		type: "plain";
+	},
+	{
+		name: "queue2";
+		type: "plain";
+	},
+	{
+		name: "pktio1.in.0";
+		type: "pktios";
+	}
+);
+
+pools: (
+	{
+		name: "pool1";
+		type: "packet";
+		size: 1024;
+		cache_size: 0
+		num: 10240;
+	},
+	{
+		name: "pool2";
+		type: "timeout";
+		cache_size: 0
+		num: 1;
+	}
+);
+
+pktios: (
+	{
+		name: "pktio1";
+		iface: "veth1";
+		pool: "pool1";
+		inmode: "schedule";
+		outmode: "queue";
+		num_in_queues: 1;
+		num_out_queues: 1;
+	}
+);
+
+timers: (
+	{
+		name: "timer1";
+		clk_src: 0
+		res_ns: 100000000;
+		min_tmo: 100000000;
+		max_tmo: 1000000000;
+		num: 1;
+	}
+);
+
+flows: (
+	{
+		name: "flow1";
+		input: "pktio1.in.0";
+		work: (
+			{
+				type: "copy";
+			},
+			{
+				type: "forward";
+				output: "queue1";
+			}
+		);
+	},
+	{
+		name: "flow2"
+		input: "queue1"
+		work: (
+			{
+				type: "copy";
+			},
+			{
+				type: "forward";
+				output: "queue2";
+			}
+		);
+	},
+	{
+		name: "flow3";
+		input: "queue2"
+		work: (
+			{
+				type: "sink";
+			}
+		);
+	},
+	{
+		name: "flow4";
+		output: "queue2"
+		work: (
+			{
+				type: "timeout_source";
+				timer: "timer1";
+				timeout_pool: "pool2";
+				timeout_ns: 1000000000;
+			}
+		);
+	}
+);
+
+workers: (
+	{
+		name: "worker1";
+		type: "schedule";
+	},
+	{
+		name: "worker2";
+		type: "plain";
+		inputs: [
+			"queue1"
+		];
+	},
+	{
+		name: "worker3";
+		type: "plain";
+		inputs: [
+			"queue2"
+		];
+	},
+	{
+		name: "worker4";
+		type: "plain";
+		outputs: [
+			"queue2"
+		];
+	}
+)
+
+cpumap: {
+	cpumask: "0xf0";
+	workers: [
+		"worker1",
+		"worker2",
+		"worker3",
+		"worker4"
+	];
+};
