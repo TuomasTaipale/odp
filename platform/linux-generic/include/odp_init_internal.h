@@ -12,6 +12,8 @@ extern "C" {
 #include <odp/api/init.h>
 #include <odp/api/thread.h>
 
+int _odp_init_local(odp_instance_t instance, _odp_internal_thread_type_t thr_type);
+
 int _odp_cpumask_init_global(const odp_init_t *params);
 int _odp_cpumask_term_global(void);
 
@@ -19,7 +21,7 @@ int _odp_system_info_init(void);
 int _odp_system_info_term(void);
 
 int _odp_thread_init_global(void);
-int _odp_thread_init_local(odp_thread_type_t type);
+int _odp_thread_init_local(_odp_internal_thread_type_t type);
 int _odp_thread_term_local(void);
 int _odp_thread_term_global(void);
 

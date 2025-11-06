@@ -19,6 +19,7 @@ extern "C" {
 
 #define _ODP_SCHED_ID_BASIC    0
 #define _ODP_SCHED_ID_SP       1
+#define _ODP_SCHED_CENTRALIZED 2
 
 /* Scheduler identifier */
 extern int _odp_sched_id;
@@ -55,8 +56,8 @@ typedef int (*schedule_ord_enq_multi_fn_t)(odp_queue_t queue, void *event_hdr[],
 					   int num, int *ret);
 typedef int (*schedule_init_global_fn_t)(void);
 typedef int (*schedule_term_global_fn_t)(void);
-typedef int (*schedule_init_local_fn_t)(void);
-typedef int (*schedule_term_local_fn_t)(void);
+typedef int (*schedule_init_local_fn_t)(_odp_internal_thread_type_t thr_type);
+typedef int (*schedule_term_local_fn_t)(_odp_internal_thread_type_t thr_type);
 typedef void (*schedule_order_lock_fn_t)(void);
 typedef void (*schedule_order_unlock_fn_t)(void);
 typedef void (*schedule_order_unlock_lock_fn_t)(void);

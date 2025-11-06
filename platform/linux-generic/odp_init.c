@@ -541,7 +541,7 @@ int odp_term_global(odp_instance_t instance)
 	return term_global(ALL_INIT);
 }
 
-static int term_local(enum init_stage stage)
+static int term_local(enum init_stage stage, _odp_internal_thread_type_t thr_type)
 {
 	int rc = 0;
 	int rc_thd = 0;
@@ -550,7 +550,7 @@ static int term_local(enum init_stage stage)
 	case ALL_INIT:
 
 	case SCHED_INIT:
-		if (_odp_sched_fn->term_local()) {
+		if (_odp_sched_fn->term_local(thr_type)) {
 			_ODP_ERR("ODP schedule local term failed.\n");
 			rc = -1;
 		}
@@ -616,7 +616,7 @@ static int term_local(enum init_stage stage)
 	return rc;
 }
 
-int odp_init_local(odp_instance_t instance, odp_thread_type_t thr_type)
+int _odp_init_local(odp_instance_t instance, _odp_internal_thread_type_t thr_type)
 {
 	enum init_stage stage = NO_INIT;
 
@@ -680,7 +680,7 @@ int odp_init_local(odp_instance_t instance, odp_thread_type_t thr_type)
 	}
 	stage = QUEUE_INIT;
 
-	if (_odp_sched_fn->init_local()) {
+	if (_odp_sched_fn->init_local(thr_type)) {
 		_ODP_ERR("ODP schedule local init failed.\n");
 		goto init_fail;
 	}
@@ -689,8 +689,13 @@ int odp_init_local(odp_instance_t instance, odp_thread_type_t thr_type)
 	return 0;
 
 init_fail:
-	term_local(stage);
+	term_local(stage, thr_type);
 	return -1;
+}
+
+int odp_init_local(odp_instance_t instance, odp_thread_type_t thr_type)
+{
+	return _odp_init_local(instance, (_odp_internal_thread_type_t)thr_type);
 }
 
 int odp_term_local(void)
@@ -702,7 +707,7 @@ int odp_term_local(void)
 	}
 	init_local_called = 0;
 
-	return term_local(ALL_INIT);
+	return term_local(ALL_INIT, _odp_this_thread->type);
 }
 
 int odp_term_abnormal(odp_instance_t instance, uint64_t flags, void *data ODP_UNUSED)

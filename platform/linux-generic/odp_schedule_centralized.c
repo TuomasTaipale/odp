@@ -39,10 +39,13 @@
 #include <odp_event_internal.h>
 #include <odp_macros_internal.h>
 #include <odp_string_internal.h>
+#include <odp_init_internal.h>
+#include <odp/api/abi/wait_until.h>
 
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <pthread.h>
 
 /* No synchronization context */
 #define NO_SYNC_CONTEXT ODP_SCHED_SYNC_PARALLEL
@@ -104,6 +107,8 @@ ODP_STATIC_ASSERT((QUEUE_LOAD * CONFIG_MAX_SCHED_QUEUES) < UINT32_MAX, "Load_val
  * queues in the worst case (all queues are scheduled, have the same priority
  * and no spreading). */
 #define MAX_RING_SIZE CONFIG_MAX_SCHED_QUEUES
+
+#define MAX_CENTRALIZED_CORES 12
 
 /* For best performance, the number of queues should be a power of two. */
 ODP_STATIC_ASSERT(_ODP_CHECK_IS_POWER2(CONFIG_MAX_SCHED_QUEUES),
@@ -301,6 +306,18 @@ typedef struct {
 		uint64_t sleep_time;
 	} powersave;
 
+	struct {
+		struct {
+			pthread_attr_t thread_attr;
+			pthread_t thread;
+		} threads[MAX_CENTRALIZED_CORES];
+
+		odp_atomic_u32_t is_running;
+		uint32_t num_threads;
+		odp_cpumask_t mask;
+		odp_queue_t job_qs;
+	} centralized;
+
 	/* Scheduler interface config options (not used in fast path) */
 	schedule_config_t config_if;
 	uint32_t max_queues;
@@ -309,6 +326,23 @@ typedef struct {
 	odp_atomic_u32_t next_rand;
 
 } sched_global_t;
+
+typedef enum {
+	CMD_INIT = 1,
+	CMD_RX,
+	CMD_RM
+} cmd_t;
+
+typedef struct ODP_ALIGNED_CACHE {
+	odp_atomic_u32_t is_sleeping;
+	odp_queue_t job_q ODP_ALIGNED_CACHE;
+	odp_event_t *evs;
+	odp_queue_t out;
+	uint64_t timeout_ns;
+	uint32_t num;
+	cmd_t cmd;
+	int thread_id;
+} sched_proxy_t;
 
 /* Check that queue[] variables are large enough */
 ODP_STATIC_ASSERT(NUM_SCHED_GRPS  <= GRP_MASK_BITS, "Groups do not fit into group mask");
@@ -321,10 +355,10 @@ ODP_STATIC_ASSERT(NUM_PKTIO        <= 256, "Pktio_index_does_not_fit_8_bits");
 /* Global scheduler context */
 static sched_global_t *sched;
 
-/* Thread local scheduler context */
-static __thread sched_local_t sched_local;
+static sched_local_t sched_thr[ODP_THREAD_COUNT_MAX];
+static sched_proxy_t sched_proxy[ODP_THREAD_COUNT_MAX];
 
-extern schedule_fn_t _odp_schedule_basic_fn;
+extern schedule_fn_t _odp_schedule_centralized_fn;
 static int schedule_ord_enq_multi_no_stash(odp_queue_t dst_queue,
 					   void *event_hdr[],
 					   int num, int *ret);
@@ -404,8 +438,32 @@ static int read_config_file(sched_global_t *sched)
 {
 	const char *str;
 	int val = 0;
+	char val_str[30];
 
+	_ODP_PRINT("!!! centralized scheduler is highly experimental, for the love of god, don't "
+		   "use it in production !!!\n");
 	_ODP_PRINT("Scheduler config:\n");
+
+	str = "sched_basic.num_centralized";
+	if (!_odp_libconfig_lookup_int(str, &val)) {
+		_ODP_ERR("Config option '%s' not found.\n", str);
+		return -1;
+	}
+
+	if (val > MAX_CENTRALIZED_CORES || val < 0)
+		val = MAX_CENTRALIZED_CORES;
+
+	sched->centralized.num_threads = val;
+	_ODP_PRINT("  %s: %i\n", str, val);
+
+	str = "sched_basic.centralized_cpumask";
+	if (!_odp_libconfig_lookup_str(str, val_str, 30 - 1)) {
+		_ODP_ERR("Config option '%s' not found.\n", str);
+		return -1;
+	}
+
+	odp_cpumask_from_str(&sched->centralized.mask, val_str);
+	_ODP_PRINT("  %s: %s\n", str, val_str);
 
 	str = "sched_basic.prio_spread";
 	if (!_odp_libconfig_lookup_int(str, &val)) {
@@ -449,7 +507,7 @@ static int read_config_file(sched_global_t *sched)
 	}
 	_ODP_PRINT("  %s: %i\n", str, val);
 
-	sched->load_balance = 1;
+	sched->load_balance = 0;
 	if (val == 0 || sched->config.num_spread == 1)
 		sched->load_balance = 0;
 
@@ -570,32 +628,60 @@ static inline uint8_t spread_from_index(uint32_t index)
 	return index % sched->config.num_spread;
 }
 
-static void sched_local_init(void)
+static void sched_local_init(_odp_internal_thread_type_t thr_type)
 {
+	const int thr = odp_thread_id();
+	sched_local_t *sched_local = &sched_thr[thr];
+	sched_proxy_t *proxy = &sched_proxy[thr];
 	int i;
 	uint8_t spread, prefer_ratio;
 	uint8_t num_spread = sched->config.num_spread;
 	uint8_t offset = 1;
+	odp_queue_param_t q_param;
 
-	memset(&sched_local, 0, sizeof(sched_local_t));
+	memset(sched_local, 0, sizeof(*sched_local));
 
-	sched_local.thr         = odp_thread_id();
-	sched_local.sync_ctx    = NO_SYNC_CONTEXT;
-	sched_local.stash.queue = ODP_QUEUE_INVALID;
+	sched_local->thr         = thr;
+	sched_local->sync_ctx    = NO_SYNC_CONTEXT;
+	sched_local->stash.queue = ODP_QUEUE_INVALID;
 
-	spread = spread_from_index(sched_local.thr);
+	spread = spread_from_index(sched_local->thr);
 	prefer_ratio = sched->config.prefer_ratio;
 
 	for (i = 0; i < SPREAD_TBL_SIZE; i++) {
-		sched_local.spread_tbl[i] = spread;
+		sched_local->spread_tbl[i] = spread;
 
 		if (num_spread > 1 && (i % prefer_ratio) == 0) {
-			sched_local.spread_tbl[i] = spread_from_index(spread + offset);
+			sched_local->spread_tbl[i] = spread_from_index(spread + offset);
 			offset++;
 			if (offset == num_spread)
 				offset = 1;
 		}
 	}
+
+	if (thr_type == THR_SCHEDULE_SERVICE)
+		return;
+
+	if (proxy->job_q == ODP_QUEUE_INVALID) {
+		odp_queue_param_init(&q_param);
+		proxy->job_q = odp_queue_create(NULL, &q_param);
+
+		if (proxy->job_q == ODP_QUEUE_INVALID)
+			_ODP_ABORT("Failed to create job queue for thread\n");
+
+		odp_atomic_init_u32(&proxy->is_sleeping, 0);
+	}
+
+	proxy->evs = NULL;
+	proxy->num = 0;
+	proxy->thread_id = thr;
+
+	if (sched->centralized.job_qs == ODP_QUEUE_INVALID)
+		proxy->cmd = CMD_INIT;
+	else
+		if (odp_queue_enq(sched->centralized.job_qs,
+				  (odp_event_t)(uintptr_t)proxy->job_q) < 0)
+			_ODP_ABORT("Failed to schedule thread job queue: %d\n", proxy->thread_id);
 }
 
 static int schedule_init_global(void)
@@ -607,7 +693,7 @@ static int schedule_init_global(void)
 
 	_ODP_DBG("Schedule init ... ");
 
-	shm = odp_shm_reserve("_odp_sched_basic_global",
+	shm = odp_shm_reserve("_odp_sched_centralized_global",
 			      sizeof(sched_global_t),
 			      ODP_CACHE_LINE_SIZE,
 			      0);
@@ -618,6 +704,8 @@ static int schedule_init_global(void)
 
 	sched = odp_shm_addr(shm);
 	memset(sched, 0, sizeof(sched_global_t));
+	odp_atomic_init_u32(&sched->centralized.is_running, 1);
+	sched->centralized.job_qs = ODP_QUEUE_INVALID;
 
 	if (read_config_file(sched)) {
 		odp_shm_free(shm);
@@ -625,7 +713,7 @@ static int schedule_init_global(void)
 	}
 
 	if (sched->config.order_stash_size == 0)
-		_odp_schedule_basic_fn.ord_enq_multi = schedule_ord_enq_multi_no_stash;
+		_odp_schedule_centralized_fn.ord_enq_multi = schedule_ord_enq_multi_no_stash;
 
 	sched->shm = shm;
 	prefer_ratio = sched->config.prefer_ratio;
@@ -717,6 +805,19 @@ static int schedule_term_global(void)
 	int i, j, grp;
 	uint32_t ring_mask = sched->ring_mask;
 
+	if (odp_global_rw->schedule_configured == 1) {
+		odp_atomic_store_u32(&sched->centralized.is_running, 0);
+
+		for (i = 0; i < (int)sched->centralized.num_threads; i++) {
+			(void)pthread_join(sched->centralized.threads[i].thread, NULL);
+			(void)pthread_attr_destroy(&sched->centralized.threads[i].thread_attr);
+		}
+
+		(void)odp_queue_destroy(sched->centralized.job_qs);
+
+		printf("************************ SCHEDULE SERVICE SHUT DOWN\n");
+	}
+
 	for (grp = 0; grp < NUM_SCHED_GRPS; grp++) {
 		for (i = 0; i < NUM_PRIO; i++) {
 			for (j = 0; j < MAX_SPREAD; j++) {
@@ -747,9 +848,9 @@ static int schedule_term_global(void)
 	return rc;
 }
 
-static int schedule_init_local(_odp_internal_thread_type_t thr_type ODP_UNUSED)
+static int schedule_init_local(_odp_internal_thread_type_t thr_type)
 {
-	sched_local_init();
+	sched_local_init(thr_type);
 	return 0;
 }
 
@@ -759,11 +860,11 @@ static inline void grp_update_mask(int grp, const odp_thrmask_t *new_mask)
 	odp_atomic_add_rel_u32(&sched->grp_epoch, 1);
 }
 
-static inline int grp_update_tbl(void)
+static inline int grp_update_tbl(sched_local_t *sched_local)
 {
 	int i;
 	int num = 0;
-	int thr = sched_local.thr;
+	int thr = sched_local->thr;
 	uint64_t mask = 0;
 
 	odp_ticketlock_lock(&sched->grp_lock);
@@ -773,7 +874,7 @@ static inline int grp_update_tbl(void)
 			continue;
 
 		if (odp_thrmask_isset(&sched->sched_grp[i].mask, thr)) {
-			sched_local.grp[num] = i;
+			sched_local->grp[num] = i;
 			num++;
 			mask |= (uint64_t)1 << i;
 		}
@@ -781,9 +882,9 @@ static inline int grp_update_tbl(void)
 
 	odp_ticketlock_unlock(&sched->grp_lock);
 
-	sched_local.grp_mask = mask;
-	sched_local.grp_idx = 0;
-	sched_local.num_grp = num;
+	sched_local->grp_mask = mask;
+	sched_local->grp_idx = 0;
+	sched_local->num_grp = num;
 
 	return num;
 }
@@ -1025,39 +1126,41 @@ static void schedule_pktio_start(int pktio_index, int num_pktin,
 	}
 }
 
-static inline void release_atomic(void)
+static inline void release_atomic(sched_local_t *sched_local)
 {
-	uint32_t qi  = sched_local.stash.qi;
-	ring_mpmc_rst_u32_t *ring = sched_local.stash.ring;
+	uint32_t qi  = sched_local->stash.qi;
+	ring_mpmc_rst_u32_t *ring = sched_local->stash.ring;
 
 	/* Release current atomic queue */
 	ring_mpmc_rst_u32_enq(ring, sched->ring_mask, qi);
 
 	/* We don't hold sync context anymore */
-	sched_local.sync_ctx = NO_SYNC_CONTEXT;
+	sched_local->sync_ctx = NO_SYNC_CONTEXT;
 }
 
 static void schedule_release_atomic(void)
 {
-	if (sched_local.sync_ctx == ODP_SCHED_SYNC_ATOMIC &&
-	    sched_local.stash.num_ev == 0)
-		release_atomic();
+	sched_local_t *sched_local = &sched_thr[odp_thread_id()];
+
+	if (sched_local->sync_ctx == ODP_SCHED_SYNC_ATOMIC &&
+	    sched_local->stash.num_ev == 0)
+		release_atomic(sched_local);
 }
 
-static inline int ordered_own_turn(uint32_t queue_index)
+static inline int ordered_own_turn(uint32_t queue_index, sched_local_t *sched_local)
 {
 	uint64_t ctx;
 
 	ctx = odp_atomic_load_acq_u64(&sched->order[queue_index].ctx);
 
-	return ctx == sched_local.ordered.ctx;
+	return ctx == sched_local->ordered.ctx;
 }
 
-static inline void wait_for_order(uint32_t queue_index)
+static inline void wait_for_order(uint32_t queue_index, sched_local_t *sched_local)
 {
 	/* Busy loop to synchronize ordered processing */
 	while (1) {
-		if (ordered_own_turn(queue_index))
+		if (ordered_own_turn(queue_index, sched_local))
 			break;
 		odp_cpu_pause();
 	}
@@ -1068,18 +1171,18 @@ static inline void wait_for_order(uint32_t queue_index)
  *
  * Should be called only when already in order.
  */
-static inline void ordered_stash_release(void)
+static inline void ordered_stash_release(sched_local_t *sched_local)
 {
 	int i;
 
-	for (i = 0; i < sched_local.ordered.stash_num; i++) {
+	for (i = 0; i < sched_local->ordered.stash_num; i++) {
 		odp_queue_t queue;
 		_odp_event_hdr_t **event_hdr;
 		int num, num_enq;
 
-		queue = sched_local.ordered.stash[i].queue;
-		event_hdr = sched_local.ordered.stash[i].event_hdr;
-		num = sched_local.ordered.stash[i].num;
+		queue = sched_local->ordered.stash[i].queue;
+		event_hdr = sched_local->ordered.stash[i].event_hdr;
+		num = sched_local->ordered.stash[i].num;
 
 		num_enq = odp_queue_enq_multi(queue,
 					      (odp_event_t *)event_hdr, num);
@@ -1093,32 +1196,32 @@ static inline void ordered_stash_release(void)
 			_odp_event_free_multi(&event_hdr[num_enq], num - num_enq);
 		}
 	}
-	sched_local.ordered.stash_num = 0;
+	sched_local->ordered.stash_num = 0;
 }
 
-static inline void release_ordered(void)
+static inline void release_ordered(sched_local_t *sched_local)
 {
 	uint32_t qi;
 	uint32_t i;
 
-	qi = sched_local.ordered.src_queue;
+	qi = sched_local->ordered.src_queue;
 
-	wait_for_order(qi);
+	wait_for_order(qi, sched_local);
 
 	/* Release all ordered locks */
 	for (i = 0; i < sched->queue[qi].order_lock_count; i++) {
-		if (!sched_local.ordered.lock_called.u8[i])
+		if (!sched_local->ordered.lock_called.u8[i])
 			odp_atomic_store_rel_u64(&sched->order[qi].lock[i],
-						 sched_local.ordered.ctx + 1);
+						 sched_local->ordered.ctx + 1);
 	}
 
-	sched_local.ordered.lock_called.all = 0;
-	sched_local.ordered.in_order = 0;
+	sched_local->ordered.lock_called.all = 0;
+	sched_local->ordered.in_order = 0;
 
 	/* We don't hold sync context anymore */
-	sched_local.sync_ctx = NO_SYNC_CONTEXT;
+	sched_local->sync_ctx = NO_SYNC_CONTEXT;
 
-	ordered_stash_release();
+	ordered_stash_release(sched_local);
 
 	/* Next thread can continue processing */
 	odp_atomic_add_rel_u64(&sched->order[qi].ctx, 1);
@@ -1126,24 +1229,48 @@ static inline void release_ordered(void)
 
 static void schedule_release_ordered(void)
 {
-	if (odp_unlikely((sched_local.sync_ctx != ODP_SCHED_SYNC_ORDERED) ||
-			 sched_local.stash.num_ev))
+	sched_local_t *sched_local = &sched_thr[odp_thread_id()];
+
+	if (odp_unlikely((sched_local->sync_ctx != ODP_SCHED_SYNC_ORDERED) ||
+			 sched_local->stash.num_ev))
 		return;
 
-	release_ordered();
+	release_ordered(sched_local);
 }
 
-static int schedule_term_local(_odp_internal_thread_type_t thr_type ODP_UNUSED)
+static int schedule_term_local(_odp_internal_thread_type_t thr_type)
 {
-	if (sched_local.stash.num_ev) {
+	const int thr_id = odp_thread_id();
+	sched_local_t *sched_local = &sched_thr[thr_id];
+	sched_proxy_t *proxy = &sched_proxy[thr_id];
+
+	if (sched_local->stash.num_ev) {
 		_ODP_ERR("Locally pre-scheduled events exist.\n");
 		return -1;
 	}
 
-	if (sched_local.sync_ctx == ODP_SCHED_SYNC_ATOMIC)
+	if (sched_local->sync_ctx == ODP_SCHED_SYNC_ATOMIC)
 		schedule_release_atomic();
-	else if (sched_local.sync_ctx == ODP_SCHED_SYNC_ORDERED)
+	else if (sched_local->sync_ctx == ODP_SCHED_SYNC_ORDERED)
 		schedule_release_ordered();
+
+	if (thr_type == THR_SCHEDULE_SERVICE)
+		return 0;
+
+	if (odp_global_rw->schedule_configured == 1) {
+		proxy->cmd = CMD_RM;
+		odp_atomic_store_u32(&proxy->is_sleeping, 1);
+
+		if (odp_queue_enq(proxy->job_q, (odp_event_t)(uintptr_t)proxy) < 0) {
+			_ODP_ERR("Error enqueuing job request: %d\n", proxy->thread_id);
+			return -1;
+		}
+
+		_odp_wait_until_equal_acq_u32(&proxy->is_sleeping, 0);
+	}
+
+	(void)odp_queue_destroy(proxy->job_q);
+	proxy->job_q = ODP_QUEUE_INVALID;
 
 	return 0;
 }
@@ -1246,6 +1373,124 @@ static uint32_t get_inc_group_prios(const odp_schedule_config_t *config)
 	return num;
 }
 
+static inline void reschedule_queue(odp_queue_t job_qs, odp_queue_t job_q)
+{
+	if (odp_unlikely(odp_queue_enq(job_qs, (odp_event_t)(uintptr_t)job_q) < 0))
+		_ODP_ABORT("Failed to reschedule thread job queue\n");
+}
+
+static inline int do_schedule(odp_queue_t *out_q, odp_event_t out_ev[], uint32_t max_num,
+			      sched_local_t *sched_local);
+
+static void *service_scheduling(void *args ODP_UNUSED)
+{
+	odp_atomic_u32_t *is_running = &sched->centralized.is_running;
+	odp_queue_t job_qs = sched->centralized.job_qs, job_q;
+	odp_event_t ev;
+	odp_queue_t out;
+	int ret;
+	uint64_t now;
+	sched_proxy_t *work;
+	odp_bool_t is_still_sleeping;
+
+	if (_odp_init_local((odp_instance_t)odp_global_ro.main_pid, THR_SCHEDULE_SERVICE) < 0)
+		_ODP_ABORT("Failed to locally initialize schedule service\n");
+
+	printf("************************ SCHEDULE SERVICE STARTED: %d\n", odp_cpu_id());
+
+	while (odp_atomic_load_u32(is_running) == 1) {
+		timer_run(1);
+		job_q = (odp_queue_t)(uintptr_t)odp_queue_deq(job_qs);
+
+		if (job_q == ODP_QUEUE_INVALID)
+			continue;
+
+		ev = odp_queue_deq(job_q);
+
+		if (ev == ODP_EVENT_INVALID) {
+			reschedule_queue(job_qs, job_q);
+			continue;
+		}
+
+		out = ODP_QUEUE_INVALID;
+		ret = 0;
+		now = odp_time_global_strict_ns();
+		work = (sched_proxy_t *)(uintptr_t)ev;
+
+		if (odp_likely(work->cmd == CMD_RX)) {
+			is_still_sleeping = false;
+			ret = do_schedule(&out, work->evs, work->num, &sched_thr[work->thread_id]);
+
+			if (ret == 0 && ((work->timeout_ns != ODP_SCHED_NO_WAIT &&
+			     now < work->timeout_ns) || work->timeout_ns == ODP_SCHED_WAIT)) {
+				if (odp_likely(odp_queue_enq(job_q, ev) == 0))
+					is_still_sleeping = true;
+				else
+					_ODP_ERR("Failed to re-schedule work from thread %d\n",
+						 work->thread_id);
+			}
+
+			reschedule_queue(job_qs, job_q);
+
+			if (is_still_sleeping)
+				continue;
+		}
+
+		if (ret > 0)
+			work->out = out;
+
+		work->num = ret;
+		odp_atomic_store_rel_u32(&work->is_sleeping, 0);
+	}
+
+	printf("************************ SCHEDULE SERVICE SHUTTING DOWN\n");
+
+	if (odp_term_local() < 0)
+		_ODP_ABORT("Failed to locally terminate schedule service\n");
+
+	return NULL;
+}
+
+static void create_service_threads(void)
+{
+	odp_queue_param_t param;
+	cpu_set_t cpu_set;
+	int cpu_num = odp_cpumask_first(&sched->centralized.mask);
+	int ret;
+	sched_proxy_t *proxy;
+
+	odp_queue_param_init(&param);
+	sched->centralized.job_qs = odp_queue_create(NULL, &param);
+
+	if (sched->centralized.job_qs == ODP_QUEUE_INVALID)
+		_ODP_ABORT("Failed to create service job queue\n");
+
+	for (uint32_t i = 0; i < sched->centralized.num_threads; i++) {
+		pthread_attr_init(&sched->centralized.threads[i].thread_attr);
+		CPU_ZERO(&cpu_set);
+		CPU_SET(cpu_num, &cpu_set);
+		pthread_attr_setaffinity_np(&sched->centralized.threads[i].thread_attr,
+					    sizeof(cpu_set_t), &cpu_set);
+		ret = pthread_create(&sched->centralized.threads[i].thread,
+				     &sched->centralized.threads[i].thread_attr,
+				     service_scheduling, NULL);
+
+		if (ret != 0)
+			_ODP_ABORT("Failed to start schedule service on CPU %u: %d\n", cpu_num,
+				   ret);
+
+		cpu_num = odp_cpumask_next(&sched->centralized.mask, cpu_num);
+	}
+
+	for (uint32_t i = 0; i < _ODP_ARRAY_SIZE(sched_proxy); i++) {
+		proxy = &sched_proxy[i];
+
+		if (proxy->cmd == CMD_INIT && odp_queue_enq(sched->centralized.job_qs,
+		    (odp_event_t)(uintptr_t)proxy->job_q) < 0)
+			_ODP_ABORT("Failed to schedule thread job queue: %d\n", proxy->thread_id);
+	}
+}
+
 static int schedule_config(const odp_schedule_config_t *config)
 {
 	const int max_prio = config->prio.min + config->prio.num - 1;
@@ -1333,6 +1578,7 @@ static int schedule_config(const odp_schedule_config_t *config)
 	sched->num_grp_prios += inc_grp_prios;
 
 	odp_ticketlock_unlock(&sched->grp_lock);
+	create_service_threads();
 
 	return 0;
 }
@@ -1377,14 +1623,15 @@ static inline int balance_spread(int grp, int prio, int cur_spr)
 	return new_spr;
 }
 
-static inline int copy_from_stash(odp_event_t *restrict out_ev, uint32_t max)
+static inline int copy_from_stash(odp_event_t *restrict out_ev, uint32_t max,
+				  sched_local_t *sched_local)
 {
 	int i = 0;
 
-	while (sched_local.stash.num_ev && max) {
-		out_ev[i] = sched_local.stash.ev[sched_local.stash.ev_index];
-		sched_local.stash.ev_index++;
-		sched_local.stash.num_ev--;
+	while (sched_local->stash.num_ev && max) {
+		out_ev[i] = sched_local->stash.ev[sched_local->stash.ev_index];
+		sched_local->stash.ev_index++;
+		sched_local->stash.num_ev--;
 		max--;
 		i++;
 	}
@@ -1395,6 +1642,7 @@ static inline int copy_from_stash(odp_event_t *restrict out_ev, uint32_t max)
 static int schedule_ord_enq_multi(odp_queue_t dst_queue, void *event_hdr[],
 				  int num, int *ret)
 {
+	sched_local_t *sched_local = &sched_thr[odp_thread_id()];
 	int i;
 	uint32_t stash_num;
 	queue_entry_t *dst_qentry;
@@ -1402,10 +1650,10 @@ static int schedule_ord_enq_multi(odp_queue_t dst_queue, void *event_hdr[],
 
 	/* This check is done for every queue enqueue operation, also for plain
 	 * queues. Return fast when not holding a scheduling context. */
-	if (odp_likely(sched_local.sync_ctx != ODP_SCHED_SYNC_ORDERED))
+	if (odp_likely(sched_local->sync_ctx != ODP_SCHED_SYNC_ORDERED))
 		return 0;
 
-	if (sched_local.ordered.in_order)
+	if (sched_local->ordered.in_order)
 		return 0;
 
 	dst_qentry = qentry_from_handle(dst_queue);
@@ -1413,13 +1661,13 @@ static int schedule_ord_enq_multi(odp_queue_t dst_queue, void *event_hdr[],
 	if (dst_qentry->param.order == ODP_QUEUE_ORDER_IGNORE)
 		return 0;
 
-	src_queue  = sched_local.ordered.src_queue;
-	stash_num  = sched_local.ordered.stash_num;
+	src_queue  = sched_local->ordered.src_queue;
+	stash_num  = sched_local->ordered.stash_num;
 
-	if (ordered_own_turn(src_queue)) {
+	if (ordered_own_turn(src_queue, sched_local)) {
 		/* Own turn, so can do enqueue directly. */
-		sched_local.ordered.in_order = 1;
-		ordered_stash_release();
+		sched_local->ordered.in_order = 1;
+		ordered_stash_release(sched_local);
 		return 0;
 	}
 
@@ -1428,20 +1676,20 @@ static int schedule_ord_enq_multi(odp_queue_t dst_queue, void *event_hdr[],
 	    odp_unlikely(stash_num >=  sched->config.order_stash_size)) {
 		/* If the local stash is full, wait until it is our turn and
 		 * then release the stash and do enqueue directly. */
-		wait_for_order(src_queue);
+		wait_for_order(src_queue, sched_local);
 
-		sched_local.ordered.in_order = 1;
+		sched_local->ordered.in_order = 1;
 
-		ordered_stash_release();
+		ordered_stash_release(sched_local);
 		return 0;
 	}
 
-	sched_local.ordered.stash[stash_num].queue = dst_queue;
-	sched_local.ordered.stash[stash_num].num = num;
+	sched_local->ordered.stash[stash_num].queue = dst_queue;
+	sched_local->ordered.stash[stash_num].num = num;
 	for (i = 0; i < num; i++)
-		sched_local.ordered.stash[stash_num].event_hdr[i] = event_hdr[i];
+		sched_local->ordered.stash[stash_num].event_hdr[i] = event_hdr[i];
 
-	sched_local.ordered.stash_num++;
+	sched_local->ordered.stash_num++;
 
 	*ret = num;
 	return 1;
@@ -1451,23 +1699,24 @@ static int schedule_ord_enq_multi_no_stash(odp_queue_t dst_queue,
 					   void *event_hdr[] ODP_UNUSED,
 					   int num ODP_UNUSED, int *ret ODP_UNUSED)
 {
+	sched_local_t *sched_local = &sched_thr[odp_thread_id()];
 	queue_entry_t *dst_qentry;
 	uint32_t src_queue;
 
-	if (odp_likely(sched_local.sync_ctx != ODP_SCHED_SYNC_ORDERED))
+	if (odp_likely(sched_local->sync_ctx != ODP_SCHED_SYNC_ORDERED))
 		return 0;
-	if (sched_local.ordered.in_order)
+	if (sched_local->ordered.in_order)
 		return 0;
 
 	dst_qentry = qentry_from_handle(dst_queue);
 	if (dst_qentry->param.order == ODP_QUEUE_ORDER_IGNORE)
 		return 0;
 
-	src_queue  = sched_local.ordered.src_queue;
-	if (odp_unlikely(!ordered_own_turn(src_queue)))
-		wait_for_order(src_queue);
+	src_queue  = sched_local->ordered.src_queue;
+	if (odp_unlikely(!ordered_own_turn(src_queue, sched_local)))
+		wait_for_order(src_queue, sched_local);
 
-	sched_local.ordered.in_order = 1;
+	sched_local->ordered.in_order = 1;
 	return 0;
 }
 
@@ -1541,7 +1790,8 @@ static inline int poll_pktin(uint32_t qi, int direct_recv,
 }
 
 static inline int schedule_grp_prio(odp_queue_t *out_queue, odp_event_t out_ev[], uint32_t max_num,
-				    int grp, int prio, int first_spr, int balance)
+				    int grp, int prio, int first_spr, int balance,
+				    sched_local_t *sched_local)
 {
 	int spr, new_spr, i, ret;
 	uint32_t qi;
@@ -1567,7 +1817,7 @@ static inline int schedule_grp_prio(odp_queue_t *out_queue, odp_event_t out_ev[]
 		int pktin;
 		uint32_t max_deq;
 		int stashed = 1;
-		odp_event_t *ev_tbl = sched_local.stash.ev;
+		odp_event_t *ev_tbl = sched_local->stash.ev;
 
 		if (spr >= num_spread)
 			spr = 0;
@@ -1671,18 +1921,18 @@ static inline int schedule_grp_prio(odp_queue_t *out_queue, odp_event_t out_ev[]
 			next_ctx = &sched->order[qi].next_ctx;
 			ctx = odp_atomic_fetch_inc_u64(next_ctx);
 
-			sched_local.ordered.ctx = ctx;
-			sched_local.ordered.src_queue = qi;
+			sched_local->ordered.ctx = ctx;
+			sched_local->ordered.src_queue = qi;
 
 			/* Continue scheduling ordered queues */
 			ring_mpmc_rst_u32_enq(ring, ring_mask, qi);
-			sched_local.sync_ctx = sync_ctx;
+			sched_local->sync_ctx = sync_ctx;
 
 		} else if (sync_ctx == ODP_SCHED_SYNC_ATOMIC) {
 			/* Hold queue during atomic access */
-			sched_local.stash.qi   = qi;
-			sched_local.stash.ring = ring;
-			sched_local.sync_ctx   = sync_ctx;
+			sched_local->stash.qi   = qi;
+			sched_local->stash.ring = ring;
+			sched_local->sync_ctx   = sync_ctx;
 		} else {
 			/* Continue scheduling parallel queues */
 			ring_mpmc_rst_u32_enq(ring, ring_mask, qi);
@@ -1691,12 +1941,12 @@ static inline int schedule_grp_prio(odp_queue_t *out_queue, odp_event_t out_ev[]
 		handle = queue_from_index(qi);
 
 		if (stashed) {
-			sched_local.stash.num_ev   = num;
-			sched_local.stash.ev_index = 0;
-			sched_local.stash.queue    = handle;
-			ret = copy_from_stash(out_ev, max_num);
+			sched_local->stash.num_ev   = num;
+			sched_local->stash.ev_index = 0;
+			sched_local->stash.queue    = handle;
+			ret = copy_from_stash(out_ev, max_num, sched_local);
 		} else {
-			sched_local.stash.num_ev = 0;
+			sched_local->stash.num_ev = 0;
 			ret = num;
 		}
 
@@ -1713,7 +1963,8 @@ static inline int schedule_grp_prio(odp_queue_t *out_queue, odp_event_t out_ev[]
 /*
  * Schedule queues
  */
-static inline int do_schedule(odp_queue_t *out_q, odp_event_t out_ev[], uint32_t max_num)
+static inline int do_schedule(odp_queue_t *out_q, odp_event_t out_ev[], uint32_t max_num,
+			      sched_local_t *sched_local)
 {
 	int i, num_grp, ret, spr, first_id, grp_id, grp, prio;
 	uint32_t sched_round;
@@ -1722,67 +1973,67 @@ static inline int do_schedule(odp_queue_t *out_q, odp_event_t out_ev[], uint32_t
 	uint64_t my_groups;
 	int balance = 0;
 
-	if (sched_local.stash.num_ev) {
-		ret = copy_from_stash(out_ev, max_num);
+	if (sched_local->stash.num_ev) {
+		ret = copy_from_stash(out_ev, max_num, sched_local);
 
 		if (out_q)
-			*out_q = sched_local.stash.queue;
+			*out_q = sched_local->stash.queue;
 
 		return ret;
 	}
 
 	/* Release schedule context */
-	if (sched_local.sync_ctx == ODP_SCHED_SYNC_ATOMIC)
-		release_atomic();
-	else if (sched_local.sync_ctx == ODP_SCHED_SYNC_ORDERED)
-		release_ordered();
+	if (sched_local->sync_ctx == ODP_SCHED_SYNC_ATOMIC)
+		release_atomic(sched_local);
+	else if (sched_local->sync_ctx == ODP_SCHED_SYNC_ORDERED)
+		release_ordered(sched_local);
 
-	if (odp_unlikely(sched_local.pause))
+	if (odp_unlikely(sched_local->pause))
 		return 0;
 
-	sched_round = sched_local.sched_round++;
+	sched_round = sched_local->sched_round++;
 
 	/* Each thread prefers a priority queue. Spread weight table avoids
 	 * starvation of other priority queues on low thread counts. */
-	spread_round = sched_local.spread_round;
+	spread_round = sched_local->spread_round;
 
 	if (odp_likely(sched->load_balance)) {
 		/* Spread balance is checked max_spread times in every BALANCE_ROUNDS_M1 + 1
 		 * scheduling rounds. */
-		if (odp_unlikely(sched_local.balance_on)) {
+		if (odp_unlikely(sched_local->balance_on)) {
 			balance = 1;
 
-			if (sched_local.balance_start == spread_round)
-				sched_local.balance_on = 0;
+			if (sched_local->balance_start == spread_round)
+				sched_local->balance_on = 0;
 		}
 
 		if (odp_unlikely((sched_round & BALANCE_ROUNDS_M1) == 0)) {
-			sched_local.balance_start = spread_round;
-			sched_local.balance_on    = 1;
+			sched_local->balance_start = spread_round;
+			sched_local->balance_on    = 1;
 		}
 	}
 
 	if (odp_unlikely(spread_round + 1 >= sched->max_spread))
-		sched_local.spread_round = 0;
+		sched_local->spread_round = 0;
 	else
-		sched_local.spread_round = spread_round + 1;
+		sched_local->spread_round = spread_round + 1;
 
-	spr = sched_local.spread_tbl[spread_round];
+	spr = sched_local->spread_tbl[spread_round];
 
 	epoch = odp_atomic_load_acq_u32(&sched->grp_epoch);
-	num_grp = sched_local.num_grp;
+	num_grp = sched_local->num_grp;
 
-	if (odp_unlikely(sched_local.grp_epoch != epoch)) {
-		num_grp = grp_update_tbl();
-		sched_local.grp_epoch = epoch;
+	if (odp_unlikely(sched_local->grp_epoch != epoch)) {
+		num_grp = grp_update_tbl(sched_local);
+		sched_local->grp_epoch = epoch;
 	}
 
 	if (odp_unlikely(num_grp == 0))
 		return 0;
 
-	my_groups = sched_local.grp_mask;
-	first_id = sched_local.grp_idx;
-	sched_local.grp_idx = (first_id + 1) % num_grp;
+	my_groups = sched_local->grp_mask;
+	first_id = sched_local->grp_idx;
+	sched_local->grp_idx = (first_id + 1) % num_grp;
 
 	for (prio = 0; prio < NUM_PRIO; prio++) {
 		grp_id = first_id;
@@ -1799,7 +2050,7 @@ static inline int do_schedule(odp_queue_t *out_q, odp_event_t out_ev[], uint32_t
 		}
 
 		for (i = 0; i < num_grp; i++) {
-			grp = sched_local.grp[grp_id];
+			grp = sched_local->grp[grp_id];
 
 			grp_id++;
 			if (odp_unlikely(grp_id >= num_grp))
@@ -1811,7 +2062,8 @@ static inline int do_schedule(odp_queue_t *out_q, odp_event_t out_ev[], uint32_t
 			}
 
 			/* Schedule events from the selected group and priority level */
-			ret = schedule_grp_prio(out_q, out_ev, max_num, grp, prio, spr, balance);
+			ret = schedule_grp_prio(out_q, out_ev, max_num, grp, prio, spr, balance,
+						sched_local);
 
 			if (odp_likely(ret))
 				return ret;
@@ -1825,115 +2077,30 @@ static inline int schedule_run(odp_queue_t *out_queue, odp_event_t out_ev[], uin
 {
 	timer_run(1);
 
-	return do_schedule(out_queue, out_ev, max_num);
-}
-
-static inline int schedule_loop(odp_queue_t *out_queue, uint64_t wait,
-				odp_event_t out_ev[], uint32_t max_num)
-{
-	odp_time_t next;
-	int first = 1;
-	int ret;
-
-	while (1) {
-		ret = do_schedule(out_queue, out_ev, max_num);
-		if (ret) {
-			timer_run(2);
-			break;
-		}
-		timer_run(1);
-
-		if (wait == ODP_SCHED_WAIT)
-			continue;
-
-		if (wait == ODP_SCHED_NO_WAIT)
-			break;
-
-		if (first) {
-			next = odp_time_add_ns(odp_time_local(), wait);
-			first = 0;
-			continue;
-		}
-
-		if (odp_time_cmp(next, odp_time_local()) < 0)
-			break;
-	}
-
-	return ret;
-}
-
-static inline int schedule_loop_sleep(odp_queue_t *out_queue, uint64_t wait,
-				      odp_event_t out_ev[], uint32_t max_num)
-{
-	int ret;
-	odp_time_t start, end, current, start_sleep;
-	int first = 1, sleep = 0;
-
-	while (1) {
-		ret = do_schedule(out_queue, out_ev, max_num);
-		if (ret) {
-			timer_run(2);
-			break;
-		}
-		uint64_t next = timer_run(sleep ? TIMER_SCAN_FORCE : 1);
-
-		if (first) {
-			start = odp_time_local();
-			start_sleep = odp_time_add_ns(start, sched->powersave.poll_time);
-			if (wait != ODP_SCHED_WAIT)
-				end = odp_time_add_ns(start, wait);
-			first = 0;
-			continue;
-		}
-
-		if (sleep && next) {
-			uint64_t sleep_nsec = _ODP_MIN(sched->powersave.sleep_time, next);
-
-			if (wait != ODP_SCHED_WAIT) {
-				uint64_t nsec_to_end = odp_time_diff_ns(end, current);
-
-				sleep_nsec = _ODP_MIN(sleep_nsec, nsec_to_end);
-			}
-
-			struct timespec ts = { 0, sleep_nsec };
-
-			nanosleep(&ts, NULL);
-		}
-
-		if (!sleep || wait != ODP_SCHED_WAIT)
-			current = odp_time_local();
-
-		if (!sleep && odp_time_cmp(start_sleep, current) < 0)
-			sleep = 1;
-
-		if (wait != ODP_SCHED_WAIT && odp_time_cmp(end, current) < 0)
-			break;
-	}
-
-	return ret;
+	return do_schedule(out_queue, out_ev, max_num, NULL);
 }
 
 static odp_event_t schedule(odp_queue_t *out_queue, uint64_t wait)
 {
-	odp_event_t ev;
+	odp_event_t ev = ODP_EVENT_INVALID;
+	sched_proxy_t *proxy = &sched_proxy[odp_thread_id()];
 
-	ev = ODP_EVENT_INVALID;
+	proxy->evs = &ev;
+	proxy->num = 1;
+	proxy->timeout_ns = (wait == ODP_SCHED_WAIT || wait == ODP_SCHED_NO_WAIT ?
+					wait : (wait + odp_time_global_strict_ns()));
+	proxy->cmd = CMD_RX;
+	odp_atomic_store_u32(&proxy->is_sleeping, 1);
 
-	schedule_loop(out_queue, wait, &ev, 1);
+	if (odp_queue_enq(proxy->job_q, (odp_event_t)(uintptr_t)proxy) < 0) {
+		_ODP_ERR("Error enqueuing job request: %d\n", proxy->thread_id);
+		return ev;
+	}
 
-	return ev;
-}
+	_odp_wait_until_equal_acq_u32(&proxy->is_sleeping, 0);
 
-static odp_event_t schedule_sleep(odp_queue_t *out_queue, uint64_t wait)
-{
-	odp_event_t ev;
-
-	ev = ODP_EVENT_INVALID;
-
-	if (wait == ODP_SCHED_NO_WAIT)
-		schedule_loop(out_queue, wait, &ev, 1);
-	else
-		schedule_loop_sleep(out_queue, wait, &ev, 1);
+	if (out_queue != NULL)
+		*out_queue = proxy->out;
 
 	return ev;
 }
@@ -1941,48 +2108,84 @@ static odp_event_t schedule_sleep(odp_queue_t *out_queue, uint64_t wait)
 static int schedule_multi(odp_queue_t *out_queue, uint64_t wait,
 			  odp_event_t events[], int num)
 {
-	return schedule_loop(out_queue, wait, events, num);
-}
+	sched_proxy_t *proxy = &sched_proxy[odp_thread_id()];
 
-static int schedule_multi_sleep(odp_queue_t *out_queue, uint64_t wait,
-				odp_event_t events[], int num)
-{
-	if (wait == ODP_SCHED_NO_WAIT)
-		return schedule_loop(out_queue, wait, events, num);
+	proxy->evs = events;
+	proxy->num = num;
+	proxy->timeout_ns = (wait == ODP_SCHED_WAIT || wait == ODP_SCHED_NO_WAIT ?
+					wait : wait + odp_time_global_strict_ns());
+	proxy->cmd = CMD_RX;
+	odp_atomic_store_u32(&proxy->is_sleeping, 1);
 
-	return schedule_loop_sleep(out_queue, wait, events, num);
+	if (odp_queue_enq(proxy->job_q, (odp_event_t)(uintptr_t)proxy) < 0) {
+		_ODP_ERR("Error enqueuing job request: %d\n", proxy->thread_id);
+		return 0;
+	}
+
+	_odp_wait_until_equal_acq_u32(&proxy->is_sleeping, 0);
+
+	if (out_queue != NULL)
+		*out_queue = proxy->out;
+
+	return proxy->num;
 }
 
 static int schedule_multi_no_wait(odp_queue_t *out_queue, odp_event_t events[],
 				  int num)
 {
-	return schedule_run(out_queue, events, num);
+	sched_proxy_t *proxy = &sched_proxy[odp_thread_id()];
+
+	proxy->evs = events;
+	proxy->num = num;
+	proxy->timeout_ns = ODP_SCHED_NO_WAIT;
+	proxy->cmd = CMD_RX;
+	odp_atomic_store_u32(&proxy->is_sleeping, 1);
+
+	if (odp_queue_enq(proxy->job_q, (odp_event_t)(uintptr_t)proxy) < 0) {
+		_ODP_ERR("Error enqueuing job request: %d\n", proxy->thread_id);
+		return 0;
+	}
+
+	_odp_wait_until_equal_acq_u32(&proxy->is_sleeping, 0);
+
+	if (out_queue != NULL)
+		*out_queue = proxy->out;
+
+	return proxy->num;
 }
 
 static int schedule_multi_wait(odp_queue_t *out_queue, odp_event_t events[],
 			       int num)
 {
-	int ret;
+	sched_proxy_t *proxy = &sched_proxy[odp_thread_id()];
 
-	do {
-		ret = schedule_run(out_queue, events, num);
-	} while (ret == 0);
+	proxy->evs = events;
+	proxy->num = num;
+	proxy->timeout_ns = ODP_SCHED_WAIT;
+	proxy->cmd = CMD_RX;
+	odp_atomic_store_u32(&proxy->is_sleeping, 1);
 
-	return ret;
-}
+	if (odp_queue_enq(proxy->job_q, (odp_event_t)(uintptr_t)proxy) < 0) {
+		_ODP_ERR("Error enqueuing job request: %d\n", proxy->thread_id);
+		return 0;
+	}
 
-static int schedule_multi_wait_sleep(odp_queue_t *out_queue, odp_event_t events[],
-				     int num)
-{
-	return schedule_loop_sleep(out_queue, ODP_SCHED_WAIT, events, num);
+	_odp_wait_until_equal_acq_u32(&proxy->is_sleeping, 0);
+
+	if (out_queue != NULL)
+		*out_queue = proxy->out;
+
+	return proxy->num;
 }
 
 static inline void order_lock(void)
 {
-	if (sched_local.sync_ctx != ODP_SCHED_SYNC_ORDERED)
+	sched_local_t *sched_local = &sched_thr[odp_thread_id()];
+
+	if (sched_local->sync_ctx != ODP_SCHED_SYNC_ORDERED)
 		return;
 
-	wait_for_order(sched_local.ordered.src_queue);
+	wait_for_order(sched_local->ordered.src_queue, sched_local);
 }
 
 static void order_unlock(void)
@@ -1992,16 +2195,17 @@ static void order_unlock(void)
 
 static void schedule_order_lock(uint32_t lock_index)
 {
+	sched_local_t *sched_local = &sched_thr[odp_thread_id()];
 	odp_atomic_u64_t *ord_lock;
 	uint32_t queue_index;
 
-	if (sched_local.sync_ctx != ODP_SCHED_SYNC_ORDERED)
+	if (sched_local->sync_ctx != ODP_SCHED_SYNC_ORDERED)
 		return;
 
-	queue_index = sched_local.ordered.src_queue;
+	queue_index = sched_local->ordered.src_queue;
 
 	_ODP_ASSERT(lock_index <= sched->queue[queue_index].order_lock_count &&
-		    !sched_local.ordered.lock_called.u8[lock_index]);
+		    !sched_local->ordered.lock_called.u8[lock_index]);
 
 	ord_lock = &sched->order[queue_index].lock[lock_index];
 
@@ -2011,8 +2215,8 @@ static void schedule_order_lock(uint32_t lock_index)
 
 		lock_seq = odp_atomic_load_acq_u64(ord_lock);
 
-		if (lock_seq == sched_local.ordered.ctx) {
-			sched_local.ordered.lock_called.u8[lock_index] = 1;
+		if (lock_seq == sched_local->ordered.ctx) {
+			sched_local->ordered.lock_called.u8[lock_index] = 1;
 			return;
 		}
 		odp_cpu_pause();
@@ -2021,21 +2225,22 @@ static void schedule_order_lock(uint32_t lock_index)
 
 static void schedule_order_unlock(uint32_t lock_index)
 {
+	sched_local_t *sched_local = &sched_thr[odp_thread_id()];
 	odp_atomic_u64_t *ord_lock;
 	uint32_t queue_index;
 
-	if (sched_local.sync_ctx != ODP_SCHED_SYNC_ORDERED)
+	if (sched_local->sync_ctx != ODP_SCHED_SYNC_ORDERED)
 		return;
 
-	queue_index = sched_local.ordered.src_queue;
+	queue_index = sched_local->ordered.src_queue;
 
 	_ODP_ASSERT(lock_index <= sched->queue[queue_index].order_lock_count);
 
 	ord_lock = &sched->order[queue_index].lock[lock_index];
 
-	_ODP_ASSERT(sched_local.ordered.ctx == odp_atomic_load_u64(ord_lock));
+	_ODP_ASSERT(sched_local->ordered.ctx == odp_atomic_load_u64(ord_lock));
 
-	odp_atomic_store_rel_u64(ord_lock, sched_local.ordered.ctx + 1);
+	odp_atomic_store_rel_u64(ord_lock, sched_local->ordered.ctx + 1);
 }
 
 static void schedule_order_unlock_lock(uint32_t unlock_index,
@@ -2045,9 +2250,8 @@ static void schedule_order_unlock_lock(uint32_t unlock_index,
 	schedule_order_lock(lock_index);
 }
 
-static void schedule_order_lock_start(uint32_t lock_index)
+static void schedule_order_lock_start(uint32_t lock_index ODP_UNUSED)
 {
-	(void)lock_index;
 }
 
 static void schedule_order_lock_wait(uint32_t lock_index)
@@ -2057,12 +2261,12 @@ static void schedule_order_lock_wait(uint32_t lock_index)
 
 static void schedule_pause(void)
 {
-	sched_local.pause = 1;
+	sched_thr[odp_thread_id()].pause = 1;
 }
 
 static void schedule_resume(void)
 {
-	sched_local.pause = 0;
+	sched_thr[odp_thread_id()].pause = 0;
 }
 
 static uint64_t schedule_wait_time(uint64_t ns)
@@ -2454,9 +2658,8 @@ static int schedule_thr_rem(odp_schedule_group_t group, int thr)
 	return 0;
 }
 
-static void schedule_prefetch(int num)
+static void schedule_prefetch(int num ODP_UNUSED)
 {
-	(void)num;
 }
 
 static void schedule_get_config(schedule_config_t *config)
@@ -2496,7 +2699,7 @@ static void schedule_print(void)
 
 	_ODP_PRINT("\nScheduler debug info\n");
 	_ODP_PRINT("--------------------\n");
-	_ODP_PRINT("  scheduler:         basic\n");
+	_ODP_PRINT("  scheduler:         centralized\n");
 	_ODP_PRINT("  max groups:        %u\n", capa.max_groups);
 	_ODP_PRINT("  max priorities:    %u\n", capa.max_prios);
 	_ODP_PRINT("  num spread:        %i\n", num_spread);
@@ -2563,25 +2766,15 @@ static void schedule_print(void)
 	_ODP_PRINT("\n");
 }
 
-/* Returns spread for queue debug prints */
-int _odp_sched_basic_get_spread(uint32_t queue_index)
-{
-	return sched->queue[queue_index].spread;
-}
-
-const _odp_schedule_api_fn_t _odp_schedule_basic_api;
-const _odp_schedule_api_fn_t _odp_schedule_basic_sleep_api;
+const _odp_schedule_api_fn_t _odp_schedule_centralized_api;
 
 static const _odp_schedule_api_fn_t *sched_api(void)
 {
-	if (sched->powersave.poll_time > 0)
-		return &_odp_schedule_basic_sleep_api;
-
-	return &_odp_schedule_basic_api;
+	return &_odp_schedule_centralized_api;
 }
 
 /* Fill in scheduler interface */
-schedule_fn_t _odp_schedule_basic_fn = {
+schedule_fn_t _odp_schedule_centralized_fn = {
 	.pktio_start = schedule_pktio_start,
 	.thr_add = schedule_thr_add,
 	.thr_rem = schedule_thr_rem,
@@ -2601,7 +2794,7 @@ schedule_fn_t _odp_schedule_basic_fn = {
 };
 
 /* Fill in scheduler API calls */
-const _odp_schedule_api_fn_t _odp_schedule_basic_api = {
+const _odp_schedule_api_fn_t _odp_schedule_centralized_api = {
 	.schedule_wait_time       = schedule_wait_time,
 	.schedule_capability      = schedule_capability,
 	.schedule_config_init     = schedule_config_init,
@@ -2609,44 +2802,6 @@ const _odp_schedule_api_fn_t _odp_schedule_basic_api = {
 	.schedule                 = schedule,
 	.schedule_multi           = schedule_multi,
 	.schedule_multi_wait      = schedule_multi_wait,
-	.schedule_multi_no_wait   = schedule_multi_no_wait,
-	.schedule_pause           = schedule_pause,
-	.schedule_resume          = schedule_resume,
-	.schedule_release_atomic  = schedule_release_atomic,
-	.schedule_release_ordered = schedule_release_ordered,
-	.schedule_prefetch        = schedule_prefetch,
-	.schedule_min_prio        = schedule_min_prio,
-	.schedule_max_prio        = schedule_max_prio,
-	.schedule_default_prio    = schedule_default_prio,
-	.schedule_num_prio        = schedule_num_prio,
-	.schedule_group_create    = schedule_group_create,
-	.schedule_group_create_2  = schedule_group_create_2,
-	.schedule_group_destroy   = schedule_group_destroy,
-	.schedule_group_lookup    = schedule_group_lookup,
-	.schedule_group_join      = schedule_group_join,
-	.schedule_group_leave     = schedule_group_leave,
-	.schedule_group_thrmask   = schedule_group_thrmask,
-	.schedule_group_info      = schedule_group_info,
-	.schedule_order_lock      = schedule_order_lock,
-	.schedule_order_unlock    = schedule_order_unlock,
-	.schedule_order_unlock_lock = schedule_order_unlock_lock,
-	.schedule_order_lock_start  = schedule_order_lock_start,
-	.schedule_order_lock_wait   = schedule_order_lock_wait,
-	.schedule_order_wait      = order_lock,
-	.schedule_print           = schedule_print
-};
-
-/* API functions used when powersave is enabled in the config file. */
-const _odp_schedule_api_fn_t _odp_schedule_basic_sleep_api = {
-	.schedule_wait_time       = schedule_wait_time,
-	.schedule_capability      = schedule_capability,
-	.schedule_config_init     = schedule_config_init,
-	.schedule_config          = schedule_config,
-	/* Only the following *_sleep functions differ from _odp_schedule_basic_api */
-	.schedule                 = schedule_sleep,
-	.schedule_multi           = schedule_multi_sleep,
-	.schedule_multi_wait      = schedule_multi_wait_sleep,
-	/* End of powersave specific functions */
 	.schedule_multi_no_wait   = schedule_multi_no_wait,
 	.schedule_pause           = schedule_pause,
 	.schedule_resume          = schedule_resume,

@@ -253,7 +253,7 @@ static int init_global(void)
 	return 0;
 }
 
-static int init_local(void)
+static int init_local(_odp_internal_thread_type_t thr_type ODP_UNUSED)
 {
 	memset(&sched_local, 0, sizeof(sched_local_t));
 	sched_local.thr_id = odp_thread_id();
@@ -289,7 +289,7 @@ static int term_global(void)
 	return ret;
 }
 
-static int term_local(void)
+static int term_local(_odp_internal_thread_type_t thr_type ODP_UNUSED)
 {
 	return 0;
 }

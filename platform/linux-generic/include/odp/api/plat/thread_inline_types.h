@@ -15,9 +15,15 @@ extern "C" {
 
 /** @cond _ODP_HIDE_FROM_DOXYGEN_ */
 
+typedef enum {
+	THR_WORKER = ODP_THREAD_WORKER,
+	THR_CONTROL = ODP_THREAD_CONTROL,
+	THR_SCHEDULE_SERVICE
+} _odp_internal_thread_type_t;
+
 typedef struct {
 	odp_log_func_t log_fn;
-	odp_thread_type_t type;
+	_odp_internal_thread_type_t type;
 	int thr;
 
 } _odp_thread_state_t;
