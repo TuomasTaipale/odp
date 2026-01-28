@@ -41,6 +41,12 @@ otherwise noted. An ODP implementation must internally copy the content of
 any parameters that it needs to retain after an API call. This principle
 does not apply to objects referenced through handles.
 
+Some ODP API modules explicitly define multithread safety for the pertaining
+handles and functions. For example, ODP queues can be created in thread-safe or
+thread-unsafe modes. This enables optimization possibilities for
+implementations. With modules that do not define thread-safety concepts, unless
+otherwise specified, applications can assume multithread safety.
+
 ## API headers
 
 ODP API headers are divided into the following directories.
