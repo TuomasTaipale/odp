@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2013-2018 Linaro Limited
- * Copyright (c) 2019-2025 Nokia
+ * Copyright (c) 2019-2026 Nokia
  */
 
 /**
@@ -503,7 +503,27 @@ typedef struct odp_timer_periodic_start_t {
 	/** Timeout event
 	 *
 	 *  This event is enqueued to the destination queue when the timer expires. The event type
-	 *  must be ODP_EVENT_TIMEOUT.
+	 *  must be ODP_EVENT_TIMEOUT. Event ownership is transferred to the successfully started
+	 *  timer and only certain functions are permitted to be called for the event when received
+	 *  by the application, specifically:
+	 *  - odp_event_type*() functions
+	 *  - odp_timer_periodic_ack()
+	 *  - odp_timeout_from_event*() functions
+	 *  - odp_timeout_to_event()
+	 *  - odp_timeout_timer()
+	 *  - odp_timeout_tick()
+	 *  - odp_timeout_user_ptr()
+	 *  - odp_timeout_user_area()
+	 *  - odp_timeout_print()
+	 *  - odp_timeout_to_u64()
+	 *
+	 *  Ehkäpä tällainen voisi olla sallittu, onnistuu epäjärjestynyt ackkaus ilman yllätyksiä:
+	 *
+	 *  When starting a periodic timer for the first time, 'tmo_ev' must be a valid timeout
+	 *  event. In periodic timer restart cases (cancel followed by a start without freeing),
+	 *  application can reuse the initially set 'tmo_ev' by setting this to
+	 *  ODP_TIMEOUT_INVALID. Otherwise, implementation frees the previously set event and uses
+	 *  the new event. Last set event will be freed when the timer is freed (odp_timer_free()).
 	 */
 	odp_event_t tmo_ev;
 
