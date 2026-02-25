@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2013-2018 Linaro Limited
- * Copyright (c) 2019-2025 Nokia
+ * Copyright (c) 2019-2026 Nokia
  */
 
 /**
@@ -373,6 +373,46 @@ typedef struct {
 		 */
 		uint64_t max_multiplier;
 
+		/** Parameters for periodic timeout pool
+		 *
+		 *  With periodic timers, application will receive ODP_EVENT_TIMEOUT events
+		 *  according to the configured expiration time from a timeout pool to-be-created
+		 *  by implementation for this timer pool. Timeouts will be delivered to the
+		 *  destination queues of allocated periodic timers. Depending on the
+		 *  implementation, each delivered event may be a unique event or a single event
+		 *  delivered multiple times (meaning the same event may appear in a destination
+		 *  queue multiple times if application falls behind) or something in between.
+		 *
+		 *  Application can configure user area size and initialization for the timeout
+		 *  pool, other parameters are implementation specific.
+		 *
+		 *  The received events must not be modified in any way or freed by the
+		 *  application. Attached data can be accessed in read-only fashion (e.g.
+		 *  odp_timeout_user_ptr() and odp_timeout_user_area()). Each received event must
+		 *  be acknowledged with odp_timer_periodic_ack().
+		 */
+		struct {
+			/** Minimum user area size in bytes
+			 *
+			 *  The maximum value is defined by pool capability tmo.max_uarea_size.
+			 *  Specify as 0 if no user area is needed. The default value is 0.
+			 */
+			uint32_t uarea_size;
+
+			/** See uarea_init.init_fn of odp_pool_param_t for details
+			 *  (odp_pool_param_t::init_fn). Function is called during
+			 *  odp_timer_pool_create() when timer pool type is
+			 *  ODP_TIMER_TYPE_PERIODIC.
+			 */
+			void (*init_fn)(void *uarea, uint32_t size, void *args, uint32_t index);
+
+			/** See uarea_init.args of odp_pool_param_t for details
+			 *  (odp_pool_param_t::args).
+			 */
+			void *args;
+
+		} tmo_pool;
+
 	} periodic;
 
 	/** Number of timers in the pool. */
@@ -499,13 +539,6 @@ typedef struct odp_timer_periodic_start_t {
 	 *  max_multiplier = k * freq_multiplier, where k is an integer.
 	 */
 	uint64_t freq_multiplier;
-
-	/** Timeout event
-	 *
-	 *  This event is enqueued to the destination queue when the timer expires. The event type
-	 *  must be ODP_EVENT_TIMEOUT.
-	 */
-	odp_event_t tmo_ev;
 
 } odp_timer_periodic_start_t;
 
