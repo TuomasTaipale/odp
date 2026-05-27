@@ -62,10 +62,23 @@ typedef struct odp_global_data_ro_t {
 	char uid[UID_MAXLEN];
 	system_info_t system_info;
 	hugepage_info_t hugepage_info;
+	/* Application-visible CPU set. Equal to the kernel-given process
+	 * affinity minus 'service_cpus'. Returned by
+	 * odp_cpumask_all_available() and used as the seed for the default
+	 * worker / control masks. */
 	odp_cpumask_t all_cpus;
 	odp_cpumask_t control_cpus;
 	odp_cpumask_t worker_cpus;
+	/* CPUs that the implementation reserves for ODP-internal threads
+	 * (e.g. service threads spawned by an internal subsystem). Hidden
+	 * from the application: excluded from all_cpus / worker_cpus /
+	 * control_cpus and not counted in num_cpus_installed. Populated
+	 * additively by _odp_service_cpus_reserve(). */
+	odp_cpumask_t service_cpus;
+	/* popcount(all_cpus); the application-visible CPU count. */
 	int num_cpus_installed;
+	/* popcount(service_cpus). */
+	int num_service_cpus;
 	uint8_t has_config_rt;
 	config_t libconfig_default;
 	config_t libconfig_runtime;
