@@ -422,13 +422,28 @@ int _odp_pool_init_local(void)
 	pool_t *pool;
 	int i;
 	int thr_id = odp_thread_id();
+	/* ODP-internal threads bypass the local cache so that pool buffers
+	 * are reserved for application threads. Application threads inherit
+	 * the pool's configured cache and burst sizes. */
+	const int is_internal = _odp_this_thread->type == THR_INTERNAL;
 
 	memset(&local, 0, sizeof(pool_local_t));
 
 	for (i = 0; i < CONFIG_POOLS; i++) {
+		pool_cache_t *cache;
+
 		pool           = _odp_pool_entry_from_idx(i);
-		local.cache[i] = &pool->local_cache[thr_id];
-		cache_init(local.cache[i]);
+		cache          = &pool->local_cache[thr_id];
+		local.cache[i] = cache;
+		cache_init(cache);
+
+		if (is_internal) {
+			cache->cache_size = 0;
+			cache->burst_size = 1;
+		} else {
+			cache->cache_size = pool->cache_size;
+			cache->burst_size = pool->burst_size;
+		}
 	}
 
 	local.thr_id = thr_id;
@@ -702,6 +717,25 @@ static void set_pool_cache_size(pool_t *pool, uint32_t cache_size)
 
 		pool->cache_size = cache_size;
 		pool->burst_size = burst_size;
+	}
+
+	/* Mirror the new pool sizes into every thread's local cache slot so
+	 * that fast paths can read them without dereferencing the pool. ODP
+	 * internal threads keep cache_size = 0 / burst_size = 1 to bypass the
+	 * cache; their _odp_pool_init_local() may have already executed (for
+	 * pools created before the thread) or may run later (for pools
+	 * created after the thread) - both orderings converge on the same
+	 * per-thread values. */
+	for (int t = 0; t < ODP_THREAD_COUNT_MAX; t++) {
+		pool_cache_t *cache = &pool->local_cache[t];
+
+		if (_odp_thread_is_internal(t)) {
+			cache->cache_size = 0;
+			cache->burst_size = 1;
+		} else {
+			cache->cache_size = pool->cache_size;
+			cache->burst_size = pool->burst_size;
+		}
 	}
 }
 
@@ -1364,8 +1398,10 @@ odp_event_t _odp_event_alloc(pool_t *pool)
 		return _odp_event_from_hdr(hdr);
 	}
 
-	/* If needed, get more from the global pool */
-	uint32_t burst = pool->burst_size;
+	/* If needed, get more from the global pool. Use the thread-local
+	 * burst size so that ODP-internal threads (burst_size=1) take only
+	 * one buffer and skip the cache push below. */
+	uint32_t burst = cache->burst_size;
 	uint32_t mask = pool->ring_mask;
 	_odp_event_hdr_t *hdr_tmp[burst];
 	ring_mpmc_rst_ptr_t *ring = &pool->ring->hdr;
@@ -1402,7 +1438,9 @@ int _odp_event_alloc_multi(pool_t *pool, _odp_event_hdr_t *event_hdr[], int max_
 	_odp_event_hdr_t *hdr;
 	uint32_t mask, num_ch, num_alloc, i;
 	uint32_t num_deq = 0;
-	uint32_t burst_size = pool->burst_size;
+	/* Use thread-local burst size; ODP-internal threads have burst_size=1
+	 * which makes burst == num_deq below and avoids stashing extras. */
+	uint32_t burst_size = cache->burst_size;
 
 	/* First pull packets from local cache */
 	num_ch = cache_pop(cache, event_hdr, max_num);
@@ -1463,7 +1501,9 @@ static inline void event_free_to_pool(pool_t *pool,
 	pool_cache_t *cache = local.cache[pool_idx];
 	ring_mpmc_rst_ptr_t *ring;
 	uint32_t cache_num, mask;
-	uint32_t cache_size = pool->cache_size;
+	/* Thread-local cache size. ODP-internal threads see 0 here, which
+	 * routes every free directly to the global pool ring. */
+	uint32_t cache_size = cache->cache_size;
 
 	/* Special case of a very large free. Move directly to
 	 * the global pool. */
@@ -1484,7 +1524,7 @@ static inline void event_free_to_pool(pool_t *pool,
 	cache_num = odp_atomic_load_u32(&cache->cache_num);
 
 	if (odp_unlikely((int)(cache_size - cache_num) < num)) {
-		int burst = pool->burst_size;
+		int burst = cache->burst_size;
 
 		ring  = &pool->ring->hdr;
 		mask  = pool->ring_mask;
@@ -1513,7 +1553,10 @@ void _odp_event_free(odp_event_t event)
 	_odp_event_hdr_t *event_hdr = _odp_event_hdr(event);
 	pool_t *pool = _odp_pool_entry(event_hdr->pool);
 	pool_cache_t *cache = local.cache[pool->pool_idx];
-	const uint32_t cache_size = pool->cache_size;
+	/* Thread-local cache size. ODP-internal threads see 0 here and take
+	 * the direct-to-ring path below, avoiding stashing buffers away from
+	 * application threads. */
+	const uint32_t cache_size = cache->cache_size;
 	uint32_t cache_num;
 
 	if (odp_unlikely(cache_size == 0)) {
@@ -1530,7 +1573,7 @@ void _odp_event_free(odp_event_t event)
 	cache_num = odp_atomic_load_u32(&cache->cache_num);
 
 	if (odp_unlikely(cache_size == cache_num)) {
-		const uint32_t burst = pool->burst_size;
+		const uint32_t burst = cache->burst_size;
 		_odp_event_hdr_t *ev_hdr[burst];
 		ring_mpmc_rst_ptr_t *ring = &pool->ring->hdr;
 		uint32_t mask = pool->ring_mask;

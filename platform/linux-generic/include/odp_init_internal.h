@@ -47,6 +47,14 @@ int _odp_thread_init_local(_odp_internal_thread_type_t type);
 int _odp_thread_term_local(void);
 int _odp_thread_term_global(void);
 
+/* Returns 1 if the slot 'thr_id' is currently allocated to an ODP-internal
+ * thread, 0 otherwise (including unallocated and out-of-range slots).
+ *
+ * Intended for use by subsystems (e.g. pool) that need to specialize
+ * per-thread state by internal vs. application thread type when iterating
+ * all thread id slots. */
+int _odp_thread_is_internal(int thr_id);
+
 int _odp_pcapng_init_global(void);
 int _odp_pcapng_term_global(void);
 
