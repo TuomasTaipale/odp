@@ -138,6 +138,7 @@ noinst_HEADERS = \
 		  include/odp_classification_datamodel.h \
 		  include/odp_classification_internal.h \
 		  include/odp_config_internal.h \
+		  include/odp_crypto_if.h \
 		  include/odp_crypto_internal.h \
 		  include/odp_debug_internal.h \
 		  include/odp_dpdk_common.h \
@@ -301,22 +302,21 @@ __LIB__libodp_linux_la_SOURCES = \
 			   pktio/socket_xdp.c \
 			   pktio/tap.c
 
+__LIB__libodp_linux_la_SOURCES += \
+			   odp_crypto_if.c \
+			   odp_crypto_null.c
+
 if WITH_OPENSSL_CRYPTO
 __LIB__libodp_linux_la_SOURCES += \
 			   odp_crypto_openssl.c
-else
+endif
 if WITH_ARMV8_CRYPTO
 __LIB__libodp_linux_la_SOURCES += \
 			   arch/aarch64/odp_crypto_armv8.c
-else
+endif
 if WITH_IPSECMB_CRYPTO
 __LIB__libodp_linux_la_SOURCES += \
 			   odp_crypto_ipsecmb.c
-else
-__LIB__libodp_linux_la_SOURCES += \
-			   odp_crypto_null.c
-endif
-endif
 endif
 
 if WITH_ML

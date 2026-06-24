@@ -24,6 +24,7 @@
 #include <odp/api/plat/event_inlines.h>
 
 #include <odp_crypto_internal.h>
+#include <odp_crypto_if.h>
 
 #define MAX_SESSIONS 32
 
@@ -116,7 +117,7 @@ void free_session(odp_crypto_generic_session_t *session)
 	odp_spinlock_unlock(&global->lock);
 }
 
-int odp_crypto_capability(odp_crypto_capability_t *capa)
+static int null_capability(odp_crypto_capability_t *capa)
 {
 	if (odp_global_ro.disable.crypto) {
 		_ODP_ERR("Crypto is disabled\n");
@@ -143,9 +144,9 @@ int odp_crypto_capability(odp_crypto_capability_t *capa)
 	return 0;
 }
 
-int odp_crypto_cipher_capability(odp_cipher_alg_t cipher,
-				 odp_crypto_cipher_capability_t dst[],
-				 int num_copy)
+static int null_cipher_capability(odp_cipher_alg_t cipher,
+				  odp_crypto_cipher_capability_t dst[],
+				  int num_copy)
 {
 	const odp_crypto_cipher_capability_t *src;
 	int num;
@@ -168,8 +169,8 @@ int odp_crypto_cipher_capability(odp_cipher_alg_t cipher,
 	return num;
 }
 
-int odp_crypto_auth_capability(odp_auth_alg_t auth,
-			       odp_crypto_auth_capability_t dst[], int num_copy)
+static int null_auth_capability(odp_auth_alg_t auth,
+				odp_crypto_auth_capability_t dst[], int num_copy)
 {
 	const odp_crypto_auth_capability_t *src;
 	int num;
@@ -192,10 +193,10 @@ int odp_crypto_auth_capability(odp_auth_alg_t auth,
 	return num;
 }
 
-int
-odp_crypto_session_create(const odp_crypto_session_param_t *param,
-			  odp_crypto_session_t *session_out,
-			  odp_crypto_ses_create_err_t *status)
+static int
+null_session_create(const odp_crypto_session_param_t *param,
+		    odp_crypto_session_t *session_out,
+		    odp_crypto_ses_create_err_t *status)
 {
 	int rc;
 	odp_crypto_generic_session_t *session;
@@ -279,7 +280,7 @@ err:
 	return -1;
 }
 
-int odp_crypto_session_destroy(odp_crypto_session_t session)
+static int null_session_destroy(odp_crypto_session_t session)
 {
 	odp_crypto_generic_session_t *generic;
 
@@ -289,8 +290,8 @@ int odp_crypto_session_destroy(odp_crypto_session_t session)
 	return 0;
 }
 
-int
-_odp_crypto_init_global(void)
+static int
+null_init_global(void)
 {
 	size_t mem_size;
 	odp_shm_t shm;
@@ -328,7 +329,7 @@ _odp_crypto_init_global(void)
 	return 0;
 }
 
-int _odp_crypto_term_global(void)
+static int null_term_global(void)
 {
 	int rc = 0;
 	int ret;
@@ -354,28 +355,17 @@ int _odp_crypto_term_global(void)
 	return rc;
 }
 
-int _odp_crypto_init_local(void)
+static int null_init_local(void)
 {
 	return 0;
 }
 
-int _odp_crypto_term_local(void)
+static int null_term_local(void)
 {
 	return 0;
 }
 
-void odp_crypto_session_param_init(odp_crypto_session_param_t *param)
-{
-	memset(param, 0, sizeof(odp_crypto_session_param_t));
-	param->op_type = ODP_CRYPTO_OP_TYPE_BASIC;
-}
-
-uint64_t odp_crypto_session_to_u64(odp_crypto_session_t hdl)
-{
-	return (uint64_t)hdl;
-}
-
-void odp_crypto_session_print(odp_crypto_session_t hdl)
+static void null_session_print(odp_crypto_session_t hdl)
 {
 	odp_crypto_generic_session_t *session;
 
@@ -414,10 +404,10 @@ int crypto_int(odp_packet_t pkt_in,
 	return 0;
 }
 
-int odp_crypto_op(const odp_packet_t pkt_in[],
-		  odp_packet_t pkt_out[],
-		  const odp_crypto_packet_op_param_t param[],
-		  int num_pkt)
+static int null_op(const odp_packet_t pkt_in[],
+		   odp_packet_t pkt_out[],
+		   const odp_crypto_packet_op_param_t param[],
+		   int num_pkt)
 {
 	int i, rc;
 	odp_crypto_generic_session_t *session;
@@ -434,10 +424,10 @@ int odp_crypto_op(const odp_packet_t pkt_in[],
 	return i;
 }
 
-int odp_crypto_op_enq(const odp_packet_t pkt_in[],
-		      const odp_packet_t pkt_out[],
-		      const odp_crypto_packet_op_param_t param[],
-		      int num_pkt)
+static int null_op_enq(const odp_packet_t pkt_in[],
+		       const odp_packet_t pkt_out[],
+		       const odp_crypto_packet_op_param_t param[],
+		       int num_pkt)
 {
 	odp_packet_t pkt = ODP_PACKET_INVALID;
 	odp_event_t event;
@@ -465,3 +455,19 @@ int odp_crypto_op_enq(const odp_packet_t pkt_in[],
 
 	return i;
 }
+
+const crypto_fn_t _odp_crypto_null_fn = {
+	.name = "null",
+	.init_global = null_init_global,
+	.term_global = null_term_global,
+	.init_local = null_init_local,
+	.term_local = null_term_local,
+	.capability = null_capability,
+	.cipher_capability = null_cipher_capability,
+	.auth_capability = null_auth_capability,
+	.session_create = null_session_create,
+	.session_destroy = null_session_destroy,
+	.session_print = null_session_print,
+	.op = null_op,
+	.op_enq = null_op_enq,
+};

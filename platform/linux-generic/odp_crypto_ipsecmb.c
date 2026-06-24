@@ -20,6 +20,7 @@
 #include <odp/api/plat/thread_inlines.h>
 
 #include <odp_crypto_internal.h>
+#include <odp_crypto_if.h>
 #include <odp_debug_internal.h>
 #include <odp_global_data.h>
 #include <odp_init_internal.h>
@@ -436,7 +437,7 @@ static int process_auth_snow3g_uia2_param(odp_crypto_generic_session_t *session)
 				  &session->auth.key_sched);
 }
 
-int odp_crypto_capability(odp_crypto_capability_t *capa)
+static int ipsecmb_capability(odp_crypto_capability_t *capa)
 {
 	if (NULL == capa)
 		return -1;
@@ -462,9 +463,9 @@ int odp_crypto_capability(odp_crypto_capability_t *capa)
 	return 0;
 }
 
-int odp_crypto_cipher_capability(odp_cipher_alg_t cipher,
-				 odp_crypto_cipher_capability_t dst[],
-				 int num_copy)
+static int ipsecmb_cipher_capability(odp_cipher_alg_t cipher,
+				     odp_crypto_cipher_capability_t dst[],
+				     int num_copy)
 {
 	const odp_crypto_cipher_capability_t *src;
 	int num;
@@ -495,8 +496,8 @@ int odp_crypto_cipher_capability(odp_cipher_alg_t cipher,
 	return num;
 }
 
-int odp_crypto_auth_capability(odp_auth_alg_t auth,
-			       odp_crypto_auth_capability_t dst[], int num_copy)
+static int ipsecmb_auth_capability(odp_auth_alg_t auth,
+				   odp_crypto_auth_capability_t dst[], int num_copy)
 {
 	const odp_crypto_auth_capability_t *src;
 	int num;
@@ -527,10 +528,10 @@ int odp_crypto_auth_capability(odp_auth_alg_t auth,
 	return num;
 }
 
-int
-odp_crypto_session_create(const odp_crypto_session_param_t *param,
-			  odp_crypto_session_t *session_out,
-			  odp_crypto_ses_create_err_t *status)
+static int
+ipsecmb_session_create(const odp_crypto_session_param_t *param,
+		       odp_crypto_session_t *session_out,
+		       odp_crypto_ses_create_err_t *status)
 {
 	int rc = 0;
 	odp_crypto_generic_session_t *session;
@@ -633,7 +634,7 @@ err:
 	return -1;
 }
 
-int odp_crypto_session_destroy(odp_crypto_session_t session)
+static int ipsecmb_session_destroy(odp_crypto_session_t session)
 {
 	odp_crypto_generic_session_t *generic;
 
@@ -643,7 +644,7 @@ int odp_crypto_session_destroy(odp_crypto_session_t session)
 	return 0;
 }
 
-int _odp_crypto_init_global(void)
+static int ipsecmb_init_global(void)
 {
 	size_t mem_size;
 	odp_shm_t shm;
@@ -681,7 +682,7 @@ int _odp_crypto_init_global(void)
 	return 0;
 }
 
-int _odp_crypto_term_global(void)
+static int ipsecmb_term_global(void)
 {
 	int rc = 0;
 	int ret;
@@ -707,7 +708,7 @@ int _odp_crypto_term_global(void)
 	return rc;
 }
 
-int _odp_crypto_init_local(void)
+static int ipsecmb_init_local(void)
 {
 	uint64_t flags = 0;
 
@@ -725,7 +726,7 @@ int _odp_crypto_init_local(void)
 	return 0;
 }
 
-int _odp_crypto_term_local(void)
+static int ipsecmb_term_local(void)
 {
 	if (odp_global_ro.disable.crypto)
 		return 0;
@@ -734,18 +735,7 @@ int _odp_crypto_term_local(void)
 	return 0;
 }
 
-void odp_crypto_session_param_init(odp_crypto_session_param_t *param)
-{
-	memset(param, 0, sizeof(odp_crypto_session_param_t));
-	param->op_type = ODP_CRYPTO_OP_TYPE_BASIC;
-}
-
-uint64_t odp_crypto_session_to_u64(odp_crypto_session_t hdl)
-{
-	return (uint64_t)hdl;
-}
-
-void odp_crypto_session_print(odp_crypto_session_t hdl)
+static void ipsecmb_session_print(odp_crypto_session_t hdl)
 {
 	odp_crypto_generic_session_t *session;
 
@@ -802,10 +792,10 @@ out:
 	return 0;
 }
 
-int odp_crypto_op(const odp_packet_t pkt_in[],
-		  odp_packet_t pkt_out[],
-		  const odp_crypto_packet_op_param_t param[],
-		  int num_pkt)
+static int ipsecmb_op(const odp_packet_t pkt_in[],
+		      odp_packet_t pkt_out[],
+		      const odp_crypto_packet_op_param_t param[],
+		      int num_pkt)
 {
 	int i, rc;
 	odp_crypto_generic_session_t *session;
@@ -822,10 +812,10 @@ int odp_crypto_op(const odp_packet_t pkt_in[],
 	return i;
 }
 
-int odp_crypto_op_enq(const odp_packet_t pkt_in[],
-		      const odp_packet_t pkt_out[],
-		      const odp_crypto_packet_op_param_t param[],
-		      int num_pkt)
+static int ipsecmb_op_enq(const odp_packet_t pkt_in[],
+			  const odp_packet_t pkt_out[],
+			  const odp_crypto_packet_op_param_t param[],
+			  int num_pkt)
 {
 	odp_packet_t pkt;
 	odp_event_t event;
@@ -853,3 +843,19 @@ int odp_crypto_op_enq(const odp_packet_t pkt_in[],
 
 	return i;
 }
+
+const crypto_fn_t _odp_crypto_ipsecmb_fn = {
+	.name = "ipsecmb",
+	.init_global = ipsecmb_init_global,
+	.term_global = ipsecmb_term_global,
+	.init_local = ipsecmb_init_local,
+	.term_local = ipsecmb_term_local,
+	.capability = ipsecmb_capability,
+	.cipher_capability = ipsecmb_cipher_capability,
+	.auth_capability = ipsecmb_auth_capability,
+	.session_create = ipsecmb_session_create,
+	.session_destroy = ipsecmb_session_destroy,
+	.session_print = ipsecmb_session_print,
+	.op = ipsecmb_op,
+	.op_enq = ipsecmb_op_enq,
+};
