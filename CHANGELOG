@@ -101,6 +101,11 @@ for configuring flow control for periodic timer pools.
 than packet).
 * Optimize implementations for single event free functions (other event types
 than packet).
+* Build in all crypto implementations (OpenSSL, ARMv8 crypto, Intel
+Multi-Buffer, null) whose dependencies are available and select the one used at
+runtime with the `ODP_CRYPTO` environment variable. The default is now the null
+implementation, so `ODP_CRYPTO` must be set (e.g. `ODP_CRYPTO=openssl`) to use
+real cryptography.
 
 ### Performance Tests
 

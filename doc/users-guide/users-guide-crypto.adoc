@@ -135,3 +135,17 @@ ODP provides the API `odp_crypto_capability()` to inquire the implementation’s
 crypto capabilities. This interface returns a the maximum number of crypto
 sessions supported as well as bitmasks for supported algorithms and hardware
 backed algorithms.
+
+=== Selecting a crypto implementation (linux-generic)
+
+The linux-generic implementation can build in several crypto backends
+(OpenSSL, ARMv8 crypto, Intel Multi-Buffer) in addition to the always present
+null backend. Each backend whose required library was found at configure time
+is compiled in; the others are simply not available.
+
+The backend used at runtime is selected with the `ODP_CRYPTO` environment
+variable, for example `ODP_CRYPTO=openssl`. When the variable is unset or set
+to `default`, the null backend is used. The null backend does not provide any
+real cryptographic algorithms, so applications that require strong cryptography
+must select a suitable backend explicitly. Selecting a backend that was not
+built in causes ODP initialization to fail.
