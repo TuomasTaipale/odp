@@ -21,6 +21,10 @@ make -j $(nproc)
 # and systems might differ in performance.
 export CI="true"
 
+# Crypto defaults to the null implementation at runtime. Select OpenSSL so
+# that crypto and IPsec tests keep exercising real algorithms.
+export ODP_CRYPTO=openssl
+
 ODP_SCHEDULER=basic    make check
 
 # Run only validation tests for SP scheduler

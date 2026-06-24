@@ -235,13 +235,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        conf: ['--with-crypto=armv8crypto',
-               '--with-crypto=ipsecmb']
+        crypto: ['armv8crypto',
+                 'ipsecmb']
     steps:
       - uses: OpenDataPlane/action-clean-up@main
       - uses: actions/checkout@v6
       - run: sudo docker run -i -v `pwd`:/odp --privileged --shm-size 8g -e CC=gcc -e ARCH="${ARCH}"
-               -e CONF="${{matrix.conf}}" $CONTAINER_NAMESPACE/odp-ci-${OS}-${ARCH}-graviton3 /odp/scripts/ci/check_crypto.sh
+               -e CONF="--with-crypto=${{matrix.crypto}}" -e ODP_CRYPTO="${{matrix.crypto}}" $CONTAINER_NAMESPACE/odp-ci-${OS}-${ARCH}-graviton3 /odp/scripts/ci/check_crypto.sh
       - if: ${{ failure() }}
         uses: ./.github/actions/run-failure-log
       - if: ${{ success() }}

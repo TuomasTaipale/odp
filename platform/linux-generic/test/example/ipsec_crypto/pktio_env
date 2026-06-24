@@ -33,6 +33,12 @@ if [ -n "$WITH_OPENSSL_CRYPTO" ] && [ ${WITH_OPENSSL_CRYPTO} -eq 0 ]; then
 	exit 77
 fi
 
+# These tests require real cryptography, which the default null crypto
+# implementation does not provide. Select the OpenSSL implementation unless
+# another one has been requested explicitly.
+: "${ODP_CRYPTO:=openssl}"
+export ODP_CRYPTO
+
 if [ -n "$ODPH_PROC_MODE" ] && [ ${ODPH_PROC_MODE} -ne 0 ]; then
 	echo "Process mode not supported. Skipping."
 	exit 77
