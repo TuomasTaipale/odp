@@ -4,6 +4,7 @@
 
 /** @cond _ODP_HIDE_FROM_DOXYGEN_ */
 
+#include <dlfcn.h>
 #include <stdlib.h>
 
 #include <odp/helper/odph_api.h>
@@ -26,23 +27,71 @@ typedef struct {
 	TAILQ_HEAD(, parser_s) p;
 
 	config_t config;
-	char *path;
+	opts_t opts;
+	void **handles;
 	odp_bool_t init_done;
 	odp_bool_t config_done;
 } parsers_t;
 
 static parsers_t parsers;
 
-odp_bool_t config_parser_init(char *path)
+/* Loaded after baseline work is registered so library work of the same name takes precedence. */
+static odp_bool_t load_libs(void)
+{
+	if (parsers.opts.num_libs == 0U)
+		return true;
+
+	parsers.handles = calloc(parsers.opts.num_libs, sizeof(*parsers.handles));
+
+	if (parsers.handles == NULL) {
+		ODPH_ERR("Error allocating memory\n");
+		return false;
+	}
+
+	for (uint32_t i = 0U; i < parsers.opts.num_libs; ++i) {
+		parsers.handles[i] = dlopen(parsers.opts.libs[i], RTLD_NOW);
+
+		if (parsers.handles[i] == NULL) {
+			ODPH_ERR("Error loading library %s: %s\n", parsers.opts.libs[i], dlerror());
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void unload_libs(void)
+{
+	if (parsers.handles != NULL) {
+		for (uint32_t i = 0U; i < parsers.opts.num_libs; ++i) {
+			if (parsers.handles[i] != NULL)
+				dlclose(parsers.handles[i]);
+		}
+
+		free(parsers.handles);
+	}
+
+	for (uint32_t i = 0U; i < parsers.opts.num_libs; ++i)
+		free(parsers.opts.libs[i]);
+
+	free(parsers.opts.libs);
+	free(parsers.opts.path);
+}
+
+odp_bool_t config_parser_init(const opts_t *opts)
 {
 	int ret;
 	parser_t *parser;
 	odp_bool_t p_ret = true;
 
-	parsers.path = path;
+	parsers.opts = *opts;
+
+	if (!load_libs())
+		return false;
+
 	config_init(&parsers.config);
 	parsers.config_done = true;
-	ret = config_read_file(&parsers.config, parsers.path);
+	ret = config_read_file(&parsers.config, parsers.opts.path);
 
 	if (ret == CONFIG_FALSE) {
 		ODPH_ERR("Error opening configuration file, line %d: %s\n",
@@ -137,5 +186,5 @@ void config_parser_destroy(void)
 	if (parsers.config_done)
 		config_destroy(&parsers.config);
 
-	free(parsers.path);
+	unload_libs();
 }
