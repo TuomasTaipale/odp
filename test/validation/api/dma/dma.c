@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * Copyright (c) 2021-2025 Nokia
+ * Copyright (c) 2021-2026 Nokia
  */
 
 #include <odp_api.h>
@@ -19,6 +19,9 @@
 #define USER_DATA    0xdeadbeef
 #define ELEM_NUM     10u
 #define UAREA        0xaa
+#define ORDER_TRS    7u
+#define ORDER_ROUNDS 100u
+#define ORDER_WAIT   (500 * ODP_TIME_MSEC_IN_NS)
 
 typedef struct global_t {
 	odp_dma_capability_t dma_capa;
@@ -51,6 +54,15 @@ typedef struct {
 	odp_bool_t seg_alloc;
 	odp_bool_t unique_dst_segs;
 } opts_t;
+
+typedef struct {
+	odp_dma_transfer_id_t id[ORDER_TRS - 1];
+	uint8_t *src;
+	uint8_t *dst;
+	odp_dma_t dma;
+	uint32_t num_trs;
+	uint32_t trs_len;
+} compl_order_t;
 
 static global_t global;
 
@@ -1390,6 +1402,15 @@ static int check_poll_none(void)
 	return ODP_TEST_INACTIVE;
 }
 
+static int check_poll_sched(void)
+{
+	if (check_poll() == ODP_TEST_ACTIVE && check_scheduled() == ODP_TEST_ACTIVE &&
+	    global.dma_capa.max_transfers > 1)
+		return ODP_TEST_ACTIVE;
+
+	return ODP_TEST_INACTIVE;
+}
+
 static int check_src_seg_free_sync(void)
 {
 	if (global.disabled)
@@ -2212,6 +2233,179 @@ static void test_dma_addr_to_addr_event_none(void)
 	test_dma_addr_to_addr_trs(ODP_DMA_COMPL_EVENT | ODP_DMA_COMPL_NONE, 2, 0, 0);
 }
 
+static int start_compl_order_trs(const compl_order_t *ctx, uint32_t idx, odp_dma_compl_t compl)
+{
+	odp_dma_seg_t src_seg, dst_seg;
+	odp_dma_transfer_param_t trs_param;
+	odp_dma_compl_param_t compl_param;
+	int ret = 0;
+
+	memset(&src_seg, 0, sizeof(src_seg));
+	memset(&dst_seg, 0, sizeof(dst_seg));
+	src_seg.addr = ctx->src + idx * ctx->trs_len;
+	src_seg.len = ctx->trs_len;
+	dst_seg.addr = ctx->dst + idx * ctx->trs_len;
+	dst_seg.len = ctx->trs_len;
+
+	odp_dma_transfer_param_init(&trs_param);
+	trs_param.src_seg = &src_seg;
+	trs_param.dst_seg = &dst_seg;
+
+	odp_dma_compl_param_init(&compl_param);
+	compl_param.user_ptr = (void *)(uintptr_t)idx;
+
+	if (idx < ctx->num_trs - 1) {
+		compl_param.compl_mode = ODP_DMA_COMPL_POLL;
+		compl_param.transfer_id = ctx->id[idx];
+	} else {
+		compl_param.compl_mode = ODP_DMA_COMPL_EVENT;
+		compl_param.event = odp_dma_compl_to_event(compl);
+		compl_param.queue = global.queue;
+	}
+
+	for (int i = 0; i < RETRIES; i++) {
+		ret = odp_dma_transfer_start(ctx->dma, &trs_param, &compl_param);
+
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+static int poll_compl_order_trs(const compl_order_t *ctx, uint32_t idx, odp_dma_result_t *res)
+{
+	int ret = 0;
+
+	for (int i = 0; i < TIMEOUT; i++) {
+		ret = odp_dma_transfer_done(ctx->dma, ctx->id[idx], res);
+
+		if (ret)
+			break;
+
+		odp_time_wait_ns(ORDER_WAIT);
+	}
+
+	return ret;
+}
+
+static void check_compl_order_event(const compl_order_t *ctx)
+{
+	odp_queue_t from = ODP_QUEUE_INVALID;
+	odp_event_t ev = ODP_EVENT_INVALID;
+	odp_dma_result_t res;
+
+	for (int i = 0; i < TIMEOUT; i++) {
+		ev = odp_schedule(&from, odp_schedule_wait_time(ORDER_WAIT));
+
+		if (ev != ODP_EVENT_INVALID)
+			break;
+	}
+
+	CU_ASSERT_FATAL(ev != ODP_EVENT_INVALID);
+	CU_ASSERT(from == global.queue);
+	CU_ASSERT_FATAL(odp_event_type(ev) == ODP_EVENT_DMA_COMPL);
+
+	memset(&res, 0, sizeof(res));
+	CU_ASSERT(odp_dma_compl_result(odp_dma_compl_from_event(ev), &res) == 0);
+	CU_ASSERT(res.success);
+	CU_ASSERT(res.user_ptr == (void *)(uintptr_t)(ctx->num_trs - 1));
+	odp_event_free(ev);
+}
+
+static void run_compl_order_round(const compl_order_t *ctx, uint32_t round)
+{
+	const uint32_t num_poll = ctx->num_trs - 1;
+	odp_dma_compl_t compl;
+	odp_dma_result_t res;
+	uint32_t i;
+	int ret;
+
+	for (i = 0; i < ctx->num_trs; i++)
+		memset(ctx->src + i * ctx->trs_len, (uint8_t)(round * ctx->num_trs + i + 1),
+		       ctx->trs_len);
+
+	compl = odp_dma_compl_alloc(global.compl_pool);
+	CU_ASSERT_FATAL(compl != ODP_DMA_COMPL_INVALID);
+
+	for (i = 0; i < ctx->num_trs; i++) {
+		if (start_compl_order_trs(ctx, i, compl) != 1)
+			break;
+	}
+
+	CU_ASSERT(i == ctx->num_trs);
+
+	if (i < ctx->num_trs) {
+		odp_dma_compl_free(compl);
+
+		for (uint32_t j = 0; j < i; j++)
+			(void)poll_compl_order_trs(ctx, j, NULL);
+
+		return;
+	}
+
+	check_compl_order_event(ctx);
+
+	for (i = 0; i < num_poll; i++) {
+		memset(&res, 0, sizeof(res));
+		ret = odp_dma_transfer_done(ctx->dma, ctx->id[i], &res);
+		/* Completion order requires preceding transfers to be complete after the event. */
+		CU_ASSERT(ret == 1);
+
+		if (ret == 0)
+			ret = poll_compl_order_trs(ctx, i, &res);
+
+		CU_ASSERT(ret == 1);
+		CU_ASSERT(res.success);
+		CU_ASSERT(res.user_ptr == (void *)(uintptr_t)i);
+	}
+
+	CU_ASSERT(check_equal(ctx->src, ctx->dst, ctx->trs_len * ctx->num_trs) == 0);
+}
+
+static void test_dma_addr_to_addr_poll_event_order(void)
+{
+	odp_dma_param_t dma_param;
+	compl_order_t ctx;
+	const uint32_t num_failures = CU_get_number_of_failures();
+	uint32_t i, len;
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.src = global.src_addr + OFFSET;
+	ctx.dst = global.dst_addr + OFFSET;
+	ctx.num_trs = ODPH_MIN(global.dma_capa.max_transfers, ORDER_TRS);
+	ctx.trs_len = ODPH_MIN(global.len / ctx.num_trs, global.dma_capa.max_seg_len);
+	ctx.trs_len = ODPH_MIN(ctx.trs_len, (uint32_t)MIN_SEG_LEN);
+	len = ctx.trs_len * ctx.num_trs;
+	memset(global.dst_addr, 0, global.data_size);
+
+	odp_dma_param_init(&dma_param);
+	dma_param.compl_mode_mask = ODP_DMA_COMPL_POLL | ODP_DMA_COMPL_EVENT;
+	dma_param.order = ODP_DMA_ORDER_COMPL;
+	ctx.dma = odp_dma_create("poll_event_order", &dma_param);
+	CU_ASSERT_FATAL(ctx.dma != ODP_DMA_INVALID);
+
+	for (i = 0; i < ctx.num_trs - 1; i++) {
+		ctx.id[i] = odp_dma_transfer_id_alloc(ctx.dma);
+		CU_ASSERT_FATAL(ctx.id[i] != ODP_DMA_TRANSFER_ID_INVALID);
+	}
+
+	for (i = 0; i < ORDER_ROUNDS; i++) {
+		run_compl_order_round(&ctx, i);
+
+		if (CU_get_number_of_failures() > num_failures)
+			break;
+	}
+
+	CU_ASSERT(check_zero(global.dst_addr, OFFSET) == 0);
+	CU_ASSERT(check_zero(ctx.dst + len, global.len - len + TRAILER) == 0);
+
+	for (i = 0; i < ctx.num_trs - 1; i++)
+		odp_dma_transfer_id_free(ctx.dma, ctx.id[i]);
+
+	CU_ASSERT(odp_dma_destroy(ctx.dma) == 0);
+}
+
 static void test_dma_multi_addr_to_addr_sync(void)
 {
 	test_dma_addr_to_addr(ODP_DMA_COMPL_SYNC, 1, MULTI, 0);
@@ -2348,6 +2542,7 @@ odp_testinfo_t dma_suite[] = {
 				  check_dst_seg_alloc_segs_event),
 	ODP_TEST_INFO_CONDITIONAL(test_dma_addr_to_addr_poll_none, check_poll_none),
 	ODP_TEST_INFO_CONDITIONAL(test_dma_addr_to_addr_event_none, check_sched_none),
+	ODP_TEST_INFO_CONDITIONAL(test_dma_addr_to_addr_poll_event_order, check_poll_sched),
 	ODP_TEST_INFO_CONDITIONAL(test_dma_multi_addr_to_addr_sync, check_sync),
 	ODP_TEST_INFO_CONDITIONAL(test_dma_multi_addr_to_addr_sync_res, check_sync),
 	ODP_TEST_INFO_CONDITIONAL(test_dma_multi_addr_to_pkt_sync, check_sync),
